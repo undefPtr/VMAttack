@@ -141,7 +141,191 @@ IDA调试器执行
 
 ## 5. 核心模块详解
 
-### 5.1 虚拟指令识别 (VmInstruction)
+### 5.1 Instruction 类：x86 指令适配层
+
+#### 5.1.1 设计思路
+
+`Instruction` 类（`lib/Instruction.py`）是静态反混淆管线的**第一层抽象**，采用**适配器模式**将底层反汇编引擎 distorm3 的原始输出封装为面向 VM 分析领域的语义查询接口。
+
+设计目标有三个：
+1. **隔离底层引擎**：上层代码不直接调用 distorm3 API，便于将来替换为 capstone 等其他引擎
+2. **提供 VM 领域语义**：将"这条 x86 指令在 VM 分析中意味着什么"封装为 `is_catch_instr()`、`is_write_stack()` 等方法
+3. **统一 32/64 位差异**：构造时根据全局 `SV.dissassm_type` 自动选择解码模式，查询方法同时处理 EBP/RBP、ESI/RSI 等差异
+
+#### 5.1.2 在执行流中的完整生命周期
+
+Instruction 对象**仅在静态分析路径**中产生，在两个地方被创建：
+
+```
+用户点击菜单 "Static deobfuscate" 或 "Grading System Analysis"
+    │
+    ▼
+static_deobfuscate() 或 grading_automaton() → deobfuscate()
+    │
+    ├──→ get_start_push(vm_addr)              ← 创建点①
+    │       遍历 VM 函数入口的 push 序列
+    │       对每条指令: Instruction(addr, bytes)
+    │       返回 List[Instruction]
+    │       → to_vpush() 消费 Instruction，产出 List[PseudoInstruction]
+    │       ★ Instruction 在此被消费后不再使用
+    │
+    ├──→ first_deobfuscate(code_start, base, code_end)
+    │       逐字节遍历 VM 字节码：
+    │       │
+    │       ├──→ get_instruction_list(bytecode, base)    ← 创建点②
+    │       │       calc_code_addr() 查跳转表 → handler 地址
+    │       │       循环反汇编 handler 中每条 x86:
+    │       │           Instruction(addr, bytes)
+    │       │       直到遇到无条件跳转(is_uncnd_jmp)或ret(is_ret)
+    │       │       返回 List[Instruction]（一个 handler 的全部 x86 指令）
+    │       │
+    │       ├── 遍历 List[Instruction] 检测 catch 指令
+    │       │       inst.is_catch_instr()  → 是否从字节码流读取参数？
+    │       │       inst.is_byte_mov()     → 参数是 1 字节？
+    │       │       inst.is_word_mov()     → 参数是 2 字节？
+    │       │       inst.is_double_mov()   → 参数是 4 字节？
+    │       │       inst.is_quad_mov()     → 参数是 8 字节？
+    │       │       inst.get_op_str(1)     → 获取 catch 寄存器名
+    │       │
+    │       └──→ VmInstruction(instr_lst, catch_value, catch_reg, addr)
+    │               ★ List[Instruction] 被传入 VmInstruction
+    │               VmInstruction 内部大量调用 Instruction 的查询方法
+    │               识别完成后产出 self.Pseudocode (PseudoInstruction)
+    │               ★ Instruction 对象作为 VmInstruction.all_instructions 保留
+    │                  但后续流程不再直接使用，仅在 __str__ 时用于显示
+    │
+    ▼
+返回 List[VmInstruction] → add_ret_pop() → make_pop_push_rep()
+    → List[PseudoInstruction] → optimize() → 基本块 → CFG
+    （此后的流程中 Instruction 对象不再参与）
+```
+
+#### 5.1.3 两个创建点的区别
+
+| | 创建点① `get_start_push()` | 创建点② `get_instruction_list()` |
+|---|---|---|
+| **目的** | 解析 VM 函数入口的 push 序列（提取函数参数） | 解析每个字节码对应的 handler 指令序列 |
+| **输入** | VM 函数起始地址 `vm_addr` | 字节码值通过跳转表得到的 handler 地址 |
+| **终止条件** | 遇到 `mov ebp, esp`（`is_mov_basep_stackp()`） | 遇到无条件跳转（`is_uncnd_jmp()`）或 `ret`（`is_ret()`） |
+| **后续消费者** | `to_vpush()` — 直接转为 vpush 伪指令 | `VmInstruction()` — 进行完整的虚拟指令模式匹配 |
+| **创建数量** | 少量（通常 5-10 条，仅入口部分） | 大量（每个字节码的 handler 通常 3-15 条 x86 指令） |
+
+#### 5.1.4 VmInstruction 如何消费 Instruction
+
+`VmInstruction.__init__()` 接收 `List[Instruction]` 后，首先将指令分为两组：
+
+```python
+for inst in instr_lst:
+    if inst.is_vinst():          # 涉及 ESI/RSI 的指令
+        self.Vinstructions.append(inst)   # VM 基础设施（字节码指针操作）
+    else:
+        self.Instructions.append(inst)    # 实际计算逻辑
+```
+
+然后调用 `get_pseudo_code()` 依次尝试匹配 15 种虚拟指令模式。每种模式的匹配都**大量依赖 Instruction 的查询方法**，典型的匹配流程如下（以 vpush 为例）：
+
+```
+is_push() 匹配流程：
+1. 在 Instructions 中寻找 is_sub_basepointer()  → "sub ebp, N" 特征
+2. 检查之前是否有 is_cwde()/is_cbw()            → 符号扩展检测
+3. 向后搜索 is_write_stack()                     → "mov [ebp], val" 写栈
+4. 向前搜索 is_mov()                             → 追溯值的来源
+5. 通过 get_op_str()、get_reg_name() 追踪寄存器  → 确定操作数
+6. 通过 make_op(inst, op, catch_value)           → 转为 PseudoOperand
+7. 构造 PseudoInstruction('vpush', addr, [op])   → 最终产出
+```
+
+#### 5.1.5 Instruction 提供的 30+ 查询方法分类
+
+**VM 语义查询**（distorm3 原生不具备，专为 VM 分析设计）：
+
+| 方法 | 语义 | 在 VmInstruction 中的用途 |
+|------|------|--------------------------|
+| `is_catch_instr()` | 是否通过 ESI/RSI 从字节码流读取参数 | first_deobfuscate 中检测 catch |
+| `is_write_stack()` | 是否写入 VM 栈（`mov [ebp], val`） | vpush 识别的核心特征 |
+| `is_read_stack()` | 是否读取 VM 栈（`mov val, [ebp]`） | vpop 识别的核心特征 |
+| `is_isp_mov()` | 是否修改 VM 指令指针(ESI/RSI) | vjmp 识别的核心特征 |
+| `is_vinst()` | 操作数是否涉及 ESI/RSI | 区分 VM 基础设施和计算指令 |
+| `is_sub_basepointer()` | 是否 sub ebp/rbp（分配栈空间） | vpush 的入口标志 |
+| `is_add_basepointer()` | 是否 add ebp/rbp（释放栈空间） | vpop/vjmp 的入口标志 |
+| `is_mov_basep_stackp()` | 是否 `mov ebp, esp` | VM 函数入口检测、栈帧边界 |
+
+**指令类型查询**（封装 distorm3 的 mnemonic/flowControl 判断）：
+
+| 方法 | 查询 | 方法 | 查询 |
+|------|------|------|------|
+| `is_mov()` | MOV系列 | `is_add()` | ADD |
+| `is_push()` | PUSH/PUSHF | `is_pop()` | POP/POPF |
+| `is_ret()` | RET | `is_call()` | CALL |
+| `is_and()` | AND | `is_not()` | NOT |
+| `is_shr()` | SHR | `is_shl()` | SHL |
+| `is_shrd()` | SHRD | `is_shld()` | SHLD |
+| `is_imul()` | IMUL | `is_idiv()` | IDIV |
+| `is_cwde()` | CWDE | `is_cbw()` | CBW |
+| `is_cdqe()` | CDQE | `is_uncnd_jmp()` | 无条件跳转 |
+
+**MOV 大小查询**（用于确定 catch 参数的字节数）：
+
+| 方法 | 检测 | 返回的 catch 长度 |
+|------|------|------------------|
+| `is_byte_mov()` | 操作数 8 位 | 1 字节 |
+| `is_word_mov()` | 操作数 16 位 | 2 字节 |
+| `is_double_mov()` | 操作数 32 位 | 4 字节 |
+| `is_quad_mov()` | 操作数 64 位 | 8 字节 |
+| `get_mov_size()` | 自动判断 | 1/2/4/8 字节 |
+
+**操作数访问**（统一接口，被 `make_op()` 用于构造 PseudoOperand）：
+
+| 方法 | 返回 |
+|------|------|
+| `op_is_reg(n)` | 第 n 个操作数是否为寄存器 |
+| `op_is_imm(n)` | 第 n 个操作数是否为立即数 |
+| `op_is_mem(n)` | 第 n 个操作数是否为内存引用 |
+| `op_is_mem_abs(n)` | 第 n 个操作数是否为绝对地址 |
+| `get_op_str(n)` | 操作数的字符串表示 |
+| `get_op_size(n)` | 操作数的位宽 |
+| `get_op_value(n)` | 立即数的值 |
+| `get_op_disp(n)` | 内存引用的偏移量 |
+| `get_reg_name(n)` | 寄存器名 |
+| `is_rip_rel()` | 是否 RIP 相对寻址 |
+
+#### 5.1.6 三层 IR 转换总结
+
+```
+            Instruction               VmInstruction            PseudoInstruction
+        ┌─────────────────┐      ┌──────────────────┐     ┌───────────────────────┐
+输入 →  │ distorm3 反汇编  │  →   │  模式匹配识别     │  →  │  push/pop 表示         │
+        │ 的 x86 指令封装  │      │  虚拟指令类型     │     │  + 临时变量 + 优化     │
+        ├─────────────────┤      ├──────────────────┤     ├───────────────────────┤
+数据    │ opcode, operands │      │ Pseudocode       │     │ mnem, op_lst,         │
+        │ addr, size       │      │ catch_value/reg  │     │ inst_type, inst_class │
+        ├─────────────────┤      ├──────────────────┤     ├───────────────────────┤
+能力    │ 30+ is_/get_     │      │ 15种 is_xxx()    │     │ make_pop_push_rep()   │
+        │ 查询方法          │      │ 模式匹配方法      │     │ 10步 optimize()       │
+        ├─────────────────┤      ├──────────────────┤     ├───────────────────────┤
+粒度    │ 单条 x86 指令    │      │ 单条 VM 虚拟指令  │     │ 一组 push/pop + 赋值  │
+        │                  │      │ (由多条x86组成)   │     │ (由一条VM指令展开)    │
+        └─────────────────┘      └──────────────────┘     └───────────────────────┘
+               ↑                         ↑                          ↑
+          get_instruction_list()    first_deobfuscate()    add_ret_pop() +
+          get_start_push()                                 make_pop_push_rep()
+```
+
+每层抽象的价值：
+- **Instruction**：隔离反汇编引擎、提供 VM 语义查询、统一 32/64 位
+- **VmInstruction**：将 3-15 条 x86 指令归约为 1 条 VM 语义指令
+- **PseudoInstruction**：引入临时变量使数据流显式化，便于优化和可视化
+
+#### 5.1.7 已知限制
+
+Instruction 类底层依赖 distorm3，存在以下限制：
+- distorm3 已停止更新（最新版 3.5.2，2021 年 3 月）
+- 不支持 64 位 Python，导致 IDA 7.0+（使用 64 位 Python 3）无法运行静态分析
+- 仅支持 x86/AMD64 架构
+
+由于 Instruction 类的适配器设计，如需迁移到 capstone 引擎，只需修改 `Instruction.__init__()` 及内部方法实现，上层的 VmInstruction（117 处调用）和所有依赖模块完全不需要改动。
+
+### 5.2 虚拟指令识别 (VmInstruction)
 
 VM字节码的每个字节通过跳转表映射到一组x86 handler指令。VmInstruction 分析这些指令的模式，识别出15种虚拟指令：
 
