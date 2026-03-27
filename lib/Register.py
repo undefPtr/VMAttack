@@ -1,6 +1,12 @@
 #coding:utf-8
 
-"""@brief List of register classes"""
+"""
+x86/x64 寄存器家族分类工具。
+
+将通用整数寄存器按「同一物理寄存器的不同位宽别名」划分为若干类，例如 eax、ax、al、ah
+同属一类，便于在分析中统一比较或按位宽选取规范名称。
+"""
+
 _registerClasses = [
     ['al', 'ah', 'ax', 'eax', 'rax'],
     ['bl', 'bh', 'bx', 'ebx', 'rbx'],
@@ -23,7 +29,11 @@ _registerClasses = [
 
 def get_reg_class(reg):
     """
-    返回寄存器的类型/type，如ax、eax返回0
+    查询寄存器所属家族（类）的索引。
+
+    同一物理寄存器的不同写法（如 ax 与 eax）返回相同类编号；未在表中的名称返回 None。
+
+    返回寄存器的类型/type，如 ax、eax 返回 0。
     @brief Determines the register class of a given reg.
     All different register names that address the same register
     belong to the same register class e.g.: 'ax' and 'eax'
@@ -46,7 +56,11 @@ def get_reg_class(reg):
 
 def get_reg_by_size(reg_class, reg_size):
     """
-    通过reg的class索引，以及reg的大小，返回具体的寄存器。如reg_class=0,reg_size=32则返回eax
+    按家族索引与位宽（比特）返回该家族下的规范寄存器名字符串。
+
+    例如 reg_class=0、reg_size=32 时返回 eax；类无效或位宽无法映射时返回 None。
+
+    通过 reg 的 class 索引以及 reg 的大小，返回具体的寄存器。
     @brief Determines the register by its size and class
     @param reg_class The register class of the register
     @param reg_size The size of the register
@@ -73,7 +87,9 @@ def get_reg_by_size(reg_class, reg_size):
 
 def get_size_by_reg(reg):
     """
-    获取寄存器的bit位大小
+    根据寄存器名称返回其位宽（8/16/32/64）；名称不在家族列表中或无法匹配时返回 None。
+
+    获取寄存器的 bit 位大小。
     @brief Determines the size of the given register
     @param reg Register
     @return Size of register
@@ -98,7 +114,9 @@ def get_size_by_reg(reg):
 
 def get_reg_class_lst(reg_class):
     """
-    返回某一个类的寄存器list,reg_class=0则返回eax族的寄存器
-    @return Returns the whole list of a given register class 
+    返回指定家族内所有别名列表（小写），例如 reg_class=0 时返回 eax 族各名称。
+
+    返回某一个类的寄存器 list，reg_class=0 则返回 eax 族的寄存器。
+    @return Returns the whole list of a given register class
     """
     return _registerClasses[reg_class]

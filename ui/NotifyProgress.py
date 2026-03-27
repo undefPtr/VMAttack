@@ -1,4 +1,9 @@
 # coding=utf-8
+"""长时间分析任务的进度条通知小窗。
+
+基于 Qt QWidget 与 QProgressBar，在批量填充模型时由调用方调用 pbar_set/pbar_update
+反馈百分比，减轻界面“卡死”感。从 UIManager 引入 QtWidgets 以保持与主 UI 栈一致。
+"""
 __author__ = 'Anatoli Kalysch'
 
 from UIManager import QtWidgets

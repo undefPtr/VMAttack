@@ -1,4 +1,10 @@
 # coding=utf-8
+"""UI 管理：统一 Qt 依赖与各分析查看器的入口。
+
+在 PySide（IDA SDK ≤6.8）与 PyQt5（IDA SDK ≥6.9）之间做兼容，经 cute 导入
+QtGui/QtCore/QtWidgets 及 form_to_widget。按运行环境从 legacyUI 或当前包加载
+ClusterViewer、GradingViewer 等，供插件菜单与窗体复用。
+"""
 __author__ = 'Anatoli Kalysch'
 
 

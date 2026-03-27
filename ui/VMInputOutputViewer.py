@@ -1,4 +1,9 @@
 # coding=utf-8
+"""VM 函数输入/输出分析查看器。
+
+按寄存器分组列出相关 trace 行，通过背景色区分输入命中、输出命中或二者兼有，
+辅助判断 VM 数据流边界。继承 PluginViewer，消费上层 IO 分析得到的集合与上下文。
+"""
 __author__ = 'Anatoli Kalysch'
 from copy import deepcopy
 

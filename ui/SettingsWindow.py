@@ -1,4 +1,9 @@
 # coding=utf-8
+"""VMAttack 设置窗口（IDA Form）。
+
+提供字节码区间、跳转表基址、VM 函数地址、聚类/评分权重、动态分析选项等配置项；
+Show() 从 VMRepresentation 读入并写回 VMContext。供插件在分析前调整行为参数。
+"""
 __author__ = 'Anatoli Kalysch'
 
 from idaapi import Form, BADADDR

@@ -1,4 +1,10 @@
 # coding=utf-8
+"""聚类分析结果查看器。
+
+在树表中展示聚类后的 trace（单行指令与簇节点），支持基于基本块的编辑、
+有限步撤销及聚类移除等交互。依赖 VM 表示与 TraceAnalysis，为 VM 行为分段
+与模式分析提供 IDA 内可视化界面。
+"""
 __author__ = 'Anatoli Kalysch'
 
 import re

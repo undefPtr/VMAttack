@@ -1,4 +1,9 @@
 # coding=utf-8
+"""插件查看器基类。
+
+继承 IDA PluginForm，在 OnCreate 中通过 UIManager.form_to_widget 取得父控件并调用
+子类实现的 PopulateForm。各分析结果的表格/树形窗体均从此类派生，统一 Show 与关闭行为。
+"""
 __author__ = 'Anatoli Kalysch'
 
 from idaapi import PluginForm, msg

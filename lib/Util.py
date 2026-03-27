@@ -1,4 +1,11 @@
 # coding=utf-8
+"""
+IDA 插件/脚本用通用工具集合。
+
+包含：根据 IDA 信息判断架构、导入/库函数与系统库段识别、反汇编项着色、
+CPU 上下文键布局占位，以及与寄存器规范化、十六进制清洗、简单算术表达式相关的辅助函数。
+"""
+
 __author__ = 'Anatoli Kalysch'
 
 import idaapi
@@ -26,8 +33,10 @@ ctx_layout_86 = {'st':['ST0', 'ST1', 'ST2', 'ST3', 'ST4', 'ST5', 'ST6', 'ST7'],
 
 def get_arch_dynamic():
     """
+    动态判断当前 IDA/调试环境下的目标架构位宽。
+
     Determine the execution environments architecture.
-    :return: 'x64' or 'x86' if arch could be determined, else None
+    :return: 64 或 32 表示 x64/x86；无法判定时返回 None
     """
     info = idaapi.get_inf_structure()
     if info.is_64bit():
@@ -117,7 +126,13 @@ def set_new_color(addr):
 
 
 class CPU(object):
+    """
+    占位用的 CPU 执行上下文结构：寄存器、FPU 栈、段寄存器集合、标志与多媒体寄存器初值字典。
+
+    与上方 ctx_layout_* 描述的分组概念对应，供跟踪或模拟时作为键空间参考。
+    """
     def __init__(self):
+        """初始化各寄存器分组容器与默认初值。"""
         self.registers = {}
         self.st = {'ST0':0, 'ST1':0, 'ST2':0, 'ST3':0, 'ST4':0, 'ST5':0, 'ST6':0, 'ST7':0}
         self.ctrl = {'CTRL':0}
@@ -131,6 +146,8 @@ class CPU(object):
 
 def get_reg(reg_string, reg_size):
     """
+    将任意别名与目标位宽映射为 Traceline.ctx 等结构中使用的规范寄存器名字符串（小写族内名）。
+
     returns the register name to be used as key with a Traceline.ctx object
     :param reg_string: any string representing a reg, e.g. rax, RAX, eax, ah, al, etc.
     :param reg_size: size in bit of the registers in Traceline.ctx, e.g. 64, 32, 16
@@ -140,6 +157,8 @@ def get_reg(reg_string, reg_size):
 
 def sanitize_hex(hex_string):
     """
+    从输入串中仅保留十六进制数字并转为大写，去掉 0x、后缀 h 等非数字字符。
+
     Sanitize input to uppercase hex string
     :param hex_string: the input hex string, e.g. 0xabc, 0xABC, abc, 28h
     :return: sanitized hex string, e.g. ABC or 28
@@ -148,6 +167,7 @@ def sanitize_hex(hex_string):
 
 def interprete_math_expr(operands, expr):
     """
+    对操作数列表从左到右做归约：expr 为 +、- 或 *；未知运算符抛出异常。
 
     :param operands: list of operands
     :param expr: the expression to use: + or - or *

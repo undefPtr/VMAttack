@@ -1,7 +1,13 @@
 # coding=utf-8
-from ui.NotifyProgress import NotifyProgress
+"""评分系统（Grading）分析结果查看器。
 
+以表格展示动态 trace 中每条指令的评分、线程、地址、反汇编、注释及 CPU 上下文，
+阈值大于 2 时可插入“前一条 CPU 上下文”分隔行。继承 PluginViewer，配合 NotifyProgress
+显示填充进度，用于在 IDA 内查验评分自动化输出。
+"""
 __author__ = 'Anatoli Kalysch'
+
+from ui.NotifyProgress import NotifyProgress
 
 from dynamic.TraceRepresentation import Traceline
 from idc import AskLong

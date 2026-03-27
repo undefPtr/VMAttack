@@ -1,4 +1,9 @@
 # coding=utf-8
+"""抽象 VM 控制流图查看器（IDA GraphViewer）。
+
+将基本块列表与跳转关系绘制成图，支持关闭、导出 Graphviz DOT 等操作，
+用于在 IDA 中总览混淆 VM 函数的结构。内含 GraphCloser、CallbackExtension 与 BBGraph。
+"""
 __author__ = 'Anatoli Kalysch'
 
 from idaapi import *

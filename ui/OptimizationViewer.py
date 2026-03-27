@@ -1,4 +1,9 @@
 # coding=utf-8
+"""交互式 trace 优化查看器。
+
+在表格中展示当前 trace，并可选用 TraceOptimizations 中的各类优化（含选择性寄存器折叠）、
+维护撤销栈，必要时切换到 ClusterViewer。用于在 IDA 中试验并逐步简化 VM 执行迹。
+"""
 __author__ = 'Anatoli Kalysch'
 
 from _collections import deque

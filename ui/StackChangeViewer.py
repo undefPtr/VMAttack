@@ -1,4 +1,9 @@
 # coding=utf-8
+"""栈变化分析查看器。
+
+以三列表格展示栈地址、映射到的 CPU 寄存器（或虚拟寄存器别名）及执行过程中
+该位置取值的变化摘要。继承 PluginViewer，与栈追踪/虚拟寄存器分析结果对照使用。
+"""
 __author__ = 'Anatoli Kalysch'
 
 from ui.PluginViewer import PluginViewer
