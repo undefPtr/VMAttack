@@ -40,9 +40,15 @@ bb_colors = [0xddddff, 0xffdddd, 0xddffdd, 0xffddff, 0xffffdd, 0xddffff]
 
 def calc_code_addr(instr, base):
     """
-    @param instr: Bytecode of a instruction of the virtual machine.
-    @param base: Address of the jumptable of the virtual machine.
-    @return Address of the executed x86 code
+    通过跳转表将VM字节码映射到对应的x86 handler地址
+
+    跳转表结构: base[bytecode] = handler_addr
+      32位: 每项4字节, handler_addr = Dword(bytecode * 4 + base)
+      64位: 每项8字节, handler_addr = Qword(bytecode * 8 + base)
+
+    @param instr: VM字节码值(0x00-0xFF)
+    @param base: 跳转表基址
+    @return handler的x86代码起始地址
     """
     if SV.dissassm_type == SV.ASSEMBLER_32:
         return Dword((instr * 4) + base)
@@ -52,13 +58,23 @@ def calc_code_addr(instr, base):
 
 def get_instruction_list(vc, base):
     """
-    @brief Generates a list of the executed x86 instructions for the
-    given virtuel instruction (vc)
-    @param vc: Bytecode of a instruction of the virtual machine.
-    @param base: Address of the jumptable of the virtual machine.
-    @return List of executed x86 instructions
+    反汇编一个字节码对应的整个x86 handler，返回Instruction列表
+
+    执行流:
+    1. calc_code_addr() 查跳转表 → 获取handler起始地址
+    2. 若该地址未被IDA识别为代码 → 强制MakeCode
+    3. 从handler起始逐条反汇编:
+       - 读取指令字节 → 创建 Instruction(addr, bytes)
+       - 无条件跳转(jmp dispatch) → 丢弃该指令，终止（回到VM dispatch循环）
+       - ret → 保留该指令，终止（VM函数返回）
+       - 其他 → 保留，继续下一条
+
+    @param vc VM字节码值(0x00-0xFF)
+    @param base 跳转表基址
+    @return List[Instruction] — 该handler的全部有效x86指令
     """
     inst_addr = calc_code_addr(vc, base)
+    # 确保handler地址处被IDA识别为代码（可能被误标为数据）
     if not isCode(GetFlags(inst_addr)):
         MakeUnknown(inst_addr, 1, DOUNK_SIMPLE)
         MakeCode(inst_addr)
@@ -69,8 +85,10 @@ def get_instruction_list(vc, base):
         inst_bytes = GetManyBytes(inst_addr, size)
         inst = Instruction(inst_addr, inst_bytes)
         if inst.is_uncnd_jmp():
+            # 无条件跳转 = 回到dispatch循环，handler结束，丢弃jmp本身
             end_of_instruction_block = True
         elif inst.is_ret():
+            # ret = VM函数返回，handler结束，保留ret指令
             inst_lst.append(inst)
             end_of_instruction_block = True
         else:
@@ -93,10 +111,21 @@ def clear_comments(ea, endaddr):
 
 def get_start_push(vm_addr):
     """
-    @brief Generates a list of the first instructions from the
-    virtual machine
-    @param vm_addr Address of the virtual machine function
-    @return List of instructions
+    提取VM函数入口处的push序列（保存调用者上下文/传递参数）
+
+    VM函数开头的典型模式:
+      push ebx          ← 保存寄存器
+      push edi          ← 保存寄存器
+      push 0x12345678   ← 传递参数(字节码起始地址等)
+      push eax          ← 保存寄存器
+      ...
+      mov ebp, esp      ← 建立VM栈帧（终止标志）
+
+    从vm_addr逐条反汇编，直到遇到 "mov ebp, esp"(is_mov_basep_stackp)
+    终止条件之前的所有指令 → 转为vpush伪指令，表示函数参数
+
+    @param vm_addr VM函数起始地址
+    @return List[Instruction] — 入口处的push序列
     """
     inst_addr = vm_addr
     ret = []
@@ -106,6 +135,7 @@ def get_start_push(vm_addr):
         inst_bytes = GetManyBytes(inst_addr, size)
         inst = Instruction(inst_addr, inst_bytes)
         if inst.is_mov_basep_stackp():
+            # "mov ebp, esp" 标志着VM栈帧建立完成，入口push序列结束
             end_of_instruction_block = True
         else:
             inst_addr = NextHead(inst_addr)
@@ -118,10 +148,17 @@ jump_dict = {}
 
 def get_catch_reg(reg, length):
     """
-    @brief Determines the right catch register for further usage
-    @param reg Register from x86 code
-    @param length Move size of catch instruction in bytes
-    @return Register with right size or empty string
+    根据catch指令的mov大小确定正确的寄存器名
+
+    catch指令从字节码流中读取附加参数到某个寄存器，但mov可能使用
+    子寄存器(al/ax/eax)。需要根据实际读取的字节数确定正确的寄存器名。
+
+    例: catch读取1字节 → 寄存器应为 al (8位)
+        catch读取4字节 → 寄存器应为 eax (32位)
+
+    @param reg handler代码中catch指令使用的寄存器名
+    @param length catch读取的字节数(1/2/4/8)
+    @return 正确大小的寄存器名，或空字符串（无法确定时）
     """
     reg_class = get_reg_class(reg)
     if reg_class == None:
@@ -153,14 +190,24 @@ def first_deobfuscate(ea, base, endaddr):
     instr_lst = []
     vminst_lst = []
     catch_value = None
+
+    # ─── 主循环：逐字节遍历VM字节码 ─────────────────────────────
     while curraddr <= endaddr:
         inst_addr = curraddr
+
+        # ① 读取当前地址的字节值作为VM操作码
         vc = Byte(curraddr)
+
+        # ② 查跳转表 → 反汇编handler → 得到x86指令列表
         instr_lst = get_instruction_list(vc, base)
         if len(instr_lst) < 1:
             print 'error occured'
             curraddr += 1
             continue
+
+        # ③ 检测handler中是否有catch指令
+        #    catch指令通过ESI/RSI从字节码流中读取附加参数
+        #    例: movzx ecx, byte ptr [esi+1] → 从字节码流读1字节到ecx
         has_catch = False
         catch_instr = None
         for pos, inst in enumerate(instr_lst):
@@ -168,32 +215,50 @@ def first_deobfuscate(ea, base, endaddr):
                 catch_instr = inst
                 has_catch = True
                 break
+
+        # ④ 根据catch指令的mov大小，从字节码流中提取附加参数值
+        #    字节码格式: [opcode][catch_param...]
+        #    无catch → 单字节操作码, length=1
+        #    有catch → opcode + 1/2/4/8字节参数
         if has_catch:
             if catch_instr.is_byte_mov():
-                catch_value = Byte(curraddr + 1)
-                length = 2
+                catch_value = Byte(curraddr + 1)     # 读取1字节参数
+                length = 2                            # 操作码(1) + 参数(1)
             elif catch_instr.is_word_mov():
-                catch_value = Word(curraddr + 1)
-                length = 3
+                catch_value = Word(curraddr + 1)     # 读取2字节参数
+                length = 3                            # 操作码(1) + 参数(2)
             elif catch_instr.is_double_mov():
-                catch_value = Dword(curraddr + 1)
-                length = 5
+                catch_value = Dword(curraddr + 1)    # 读取4字节参数
+                length = 5                            # 操作码(1) + 参数(4)
             elif catch_instr.is_quad_mov():
-                catch_value = Qword(curraddr + 1)
-                length = 9
+                catch_value = Qword(curraddr + 1)    # 读取8字节参数
+                length = 9                            # 操作码(1) + 参数(8)
         else:
-            length = 1
-        curraddr += length
-        MakeUnknown(inst_addr, length, DOUNK_SIMPLE)
+            length = 1  # 无附加参数，单字节操作码
+
+        curraddr += length  # 前进到下一条VM字节码
+        MakeUnknown(inst_addr, length, DOUNK_SIMPLE)  # 在IDA中标记为数据
+
+        # 确定catch寄存器的正确大小名称
         if has_catch:
             catch_reg = get_catch_reg(catch_instr.get_op_str(1), length - 1)
         else:
             catch_reg = ''
+
+        # ⑤ 构造VmInstruction — 自动进行15种虚拟指令模式匹配
+        #    内部流程: 分离Vinstructions/Instructions → get_pseudo_code()
+        #    → 匹配成功设置Pseudocode → replace_catch_reg()用值替换寄存器
         vm_inst = VmInstruction(instr_lst, catch_value,
                                 catch_reg, inst_addr)
         vminst_lst.append(vm_inst)
         if (vm_inst.Pseudocode == None):
             continue
+
+        # ⑥ 控制流处理 — 遇到vjmp/vret时检查是否需要用户介入
+        #    若下一地址有正常x86代码(非VM字节码)，弹出对话框:
+        #    - 用户选Yes: 继续反混淆该地址
+        #    - 用户选No: 手动输入新的继续地址
+        #    jump_dict缓存用户选择，避免重复询问
         if (vm_inst.Pseudocode.inst_type == PI.JMP_T or
                     vm_inst.Pseudocode.inst_type == PI.RET_T):
             if isCode(GetFlags(curraddr)):
@@ -467,35 +532,101 @@ def deobfuscate(code_saddr,  base_addr, code_eaddr, vm_addr, display=4, real_sta
     @param real_start 函数真实入口地址
     @return 找到的最小跳转地址
     """
+    # ═══════════════════════════════════════════════════════════════
+    # Step 1: 环境初始化 — 根据IDA的BADADDR判断32/64位模式
+    #   设置 SV.dissassm_type，影响后续 distorm3 解码模式和跳转表项宽度
+    # ═══════════════════════════════════════════════════════════════
     set_dissassembly_type()
+
+    # ═══════════════════════════════════════════════════════════════
+    # Step 2: 读取已有IDA注释 — 保留逆向工程师之前手动标注的跳转地址
+    #   格式示例: "jumps to: 0x4012AB, 0x4012CD"
+    #   这些注释会在 Step 7 中与自动发现的跳转地址合并
+    # ═══════════════════════════════════════════════════════════════
     comment_list = read_in_comments(code_saddr, code_eaddr)
+
+    # ═══════════════════════════════════════════════════════════════
+    # Step 3: 确定混淆函数的真实入口地址
+    #   优先使用调用者指定的 real_start；
+    #   否则通过交叉引用(xref)启发式搜索：找到恰好被引用1次的地址
+    #   兜底回退到 code_saddr（字节码起始地址）
+    # ═══════════════════════════════════════════════════════════════
     if real_start == 0:
         start_addr = find_start(code_saddr, code_eaddr)
     else:
         start_addr = real_start
     if start_addr == BADADDR:
         start_addr = code_saddr
+
+    # ═══════════════════════════════════════════════════════════════
+    # Step 4: 提取VM函数入口的push序列 → 转为vpush伪指令
+    #   VM函数开头通常是一系列 push reg/imm 保存调用者上下文，
+    #   直到 "mov ebp, esp" 建立VM栈帧。这些push对应函数参数。
+    #   get_start_push(): 逐条创建Instruction → List[Instruction]
+    #   to_vpush(): Instruction → vpush PseudoInstruction
+    #   产出的 f_start_lst 会在 Step 6 插入到 start_addr 对应位置
+    # ═══════════════════════════════════════════════════════════════
     f_start_lst = []
     if vm_addr != 0:
         f_start_lst = get_start_push(vm_addr)
         f_start_lst = to_vpush(f_start_lst, start_addr)
+
+    # ═══════════════════════════════════════════════════════════════
+    # Step 5: 核心反混淆 — 字节码 → VmInstruction 列表
+    #   first_deobfuscate() 逐字节遍历 [code_saddr, code_eaddr]:
+    #     每个字节码 → 查跳转表得handler地址 → 反汇编handler为Instruction列表
+    #     → 检测catch指令(读取1/2/4/8字节附加参数)
+    #     → 构造VmInstruction(自动匹配15种虚拟指令模式)
+    #     → 遇到vjmp/vret时可能弹出用户交互对话框
+    #   deobfuscate_all() 是测试函数，遍历所有256种字节码进行翻译
+    # ═══════════════════════════════════════════════════════════════
     vm_inst_lst = first_deobfuscate(code_saddr, base_addr, code_eaddr)
     vm_inst_lst1 = deobfuscate_all(base_addr)
     display_vm_inst(vm_inst_lst1)
+
+    # ═══════════════════════════════════════════════════════════════
+    # Step 6: VmInstruction → push/pop 伪指令表示
+    #   add_ret_pop(): 将vret handler中的pop序列转为vpop伪指令
+    #     （vret前有一系列pop恢复寄存器的操作，需要显式表示）
+    #   make_pop_push_rep(): 将每条高级虚拟指令展开为push/pop序列
+    #     例: vadd(op1, op2) → vpop T1; vpop T2; vpush(T1+T2); vpush flags
+    #     引入临时变量T_xx使数据流显式化
+    #   在start_addr处插入Step 4产生的函数参数vpush序列
+    # ═══════════════════════════════════════════════════════════════
     pseudo_lst = add_ret_pop(vm_inst_lst)
     push_pop_lst = []
     lst = []
     for inst in pseudo_lst:
         if inst.addr == start_addr:
-            lst = f_start_lst
+            lst = f_start_lst  # 在函数入口处插入参数push序列
         lst += inst.make_pop_push_rep()
         for rep in lst:
             push_pop_lst.append(rep)
         lst = []
+
+    # ═══════════════════════════════════════════════════════════════
+    # Step 7: 跳转地址解析 — 合并自动发现与手动标注
+    #   get_jaddr_from_comments(): 从IDA注释中提取手动标注的跳转目标
+    #   get_jmp_addresses(): 递归回溯数据流自动发现跳转目标
+    #     对每个vjmp指令，追踪其操作数来源（最大递归深度20层）
+    #     支持多目标跳转（跳转前有连续push立即数 → 跳转表）
+    #   get_jmp_input_found(): 合并两个来源，手动标注优先
+    #   change_comments(): 将跳转目标写回IDA注释供下次使用
+    # ═══════════════════════════════════════════════════════════════
     cjmp_addrs = get_jaddr_from_comments(push_pop_lst, comment_list)
     jmp_addrs = get_jmp_addresses(push_pop_lst, code_eaddr)
     jmp_addrs = get_jmp_input_found(cjmp_addrs, jmp_addrs)
     change_comments(push_pop_lst, cjmp_addrs)
+
+    # ═══════════════════════════════════════════════════════════════
+    # Step 8: 基本块划分 + IDA着色
+    #   find_basic_blocks(): 经典leader算法
+    #     leader来源: start_addr, vjmp/vret后的下一条, 所有跳转目标
+    #     排序去重后相邻leader构成(start, end)区间 → 基本块边界
+    #   color_basic_blocks(): 用6种颜色在IDA中循环着色各基本块
+    #   make_bb_lists(): 按基本块边界切分push_pop_lst
+    #   has_locals(): 检测函数是否有局部变量(影响优化策略)
+    # ═══════════════════════════════════════════════════════════════
     basic_blocks = find_basic_blocks(push_pop_lst, start_addr, jmp_addrs)
     if basic_blocks == None:
         basic_blocks = [(code_saddr, code_eaddr)]
@@ -503,6 +634,20 @@ def deobfuscate(code_saddr,  base_addr, code_eaddr, vm_addr, display=4, real_sta
     basic_lst = make_bb_lists(push_pop_lst, basic_blocks)
     has_loc = has_locals(basic_lst)
     clear_comments(code_saddr, code_eaddr)
+
+    # ═══════════════════════════════════════════════════════════════
+    # Step 9-10: 优化 + 输出展示
+    #   display=0: 显示原始VmInstruction（最底层，无优化）
+    #   display=1: 显示push/pop伪指令（中间表示，无优化）
+    #   display>=2: 对每个基本块执行10步优化管线 → 显示优化后伪指令
+    #     并构建抽象VM控制流图(CFG):
+    #     - 节点: 每个非空基本块 → "bb0", "bb1", ...
+    #     - 边的构建逻辑:
+    #       · 有ret的基本块 → 无出边（函数返回）
+    #       · 无jmp的基本块 → 顺序连接到下一基本块(fall-through)
+    #       · 有jmp的基本块 → 查找所有跳转目标，连接到目标所在基本块
+    #     - 调用BBGraphViewer.show_graph()在IDA中渲染图形
+    # ═══════════════════════════════════════════════════════════════
     if display == 0:
         vm_list = f_start_lst + pseudo_lst
         display_vm_inst(vm_list)
@@ -539,6 +684,9 @@ def deobfuscate(code_saddr,  base_addr, code_eaddr, vm_addr, display=4, real_sta
             g = show_graph(nodes, edges, opt_basic, jmp_addrs, basic_blocks, real_start)
         except Exception, e:
             print e.message
+
+    # 返回所有跳转目标中的最小地址，供外层start()迭代使用
+    # 若存在比当前code_saddr更小的跳转目标，start()会从该地址重新执行deobfuscate
     if jmp_addrs != []:
         min_jmp = min(jmp_addrs)[0]
     else:
@@ -546,25 +694,24 @@ def deobfuscate(code_saddr,  base_addr, code_eaddr, vm_addr, display=4, real_sta
     return min_jmp
 
 
-# need this to auto delete all variables
-# so there are no objects left in ida python shell
-# TODO
-# * problem mit x64 push/pop
-# * vebpmov Problem?
-# * evtl schreibe start push to comments
 def start(code_saddr, base_addr, code_eaddr, vm_addr, display=4, real_start=0):
     """
-    @brief Entrypoint of the deobfuscation; starts
-    deobfuscate until the minimal code start address is found
-    @param code_saddr Address of the start of obfuscated code
-    @param base_addr Address of the jumptable of the virtual machine
-    @param code_eaddr Address of the end of obfuscated code
-    @param vm_addr Address of the virtual machine function
-    @param display Set output type
-        * 0 : VirtualInstruction
-        * 1 : PseudoInstruction Push/Pop representation
-        * 2 : PseudoInstruction full optimized
-    @param real_start Address of entry point of the function
+    迭代驱动入口 — 反复调用deobfuscate直到覆盖所有前向跳转
+
+    问题背景: VM字节码中可能存在前向跳转(跳转到比当前起始地址更小的地址)。
+    第一轮deobfuscate可能只处理了部分字节码，但发现跳转目标在更前面。
+
+    迭代机制:
+      deobfuscate() 返回所有跳转目标中的最小地址 min_jmp
+      若 min_jmp < 当前起始地址 → 从 min_jmp 重新开始
+      循环终止: min_jmp >= 当前起始地址（所有字节码已覆盖）
+
+    @param code_saddr 混淆代码起始地址
+    @param base_addr 跳转表基址
+    @param code_eaddr 混淆代码结束地址
+    @param vm_addr VM函数起始地址
+    @param display 输出模式: 0=VmInstruction, 1=push/pop, 2+=优化+CFG
+    @param real_start 函数真实入口地址
     """
     old_min = BADADDR
     n_min = code_saddr
@@ -574,8 +721,6 @@ def start(code_saddr, base_addr, code_eaddr, vm_addr, display=4, real_start=0):
         n_min = deobfuscate(old_min, base_addr, code_eaddr, vm_addr, display, start)
         if start == 0:
             start = code_saddr
-            # if n_min < 0x4048b6:# TODO
-            #    break
 
 def color_basic_blocks(basic_lst):
     """
@@ -774,11 +919,19 @@ def static_vmctx(manual=False):
 
 def static_deobfuscate(display=0, userchoice=False):
     """
-    Wrapper for deobfuscate function which allows for manual user Input.
-    :param display: Bool -> use output window or BBGraphViewer
-    :param userchoice: let user input vm context values
+    静态反混淆的用户入口 — 从IDA菜单调用
+
+    执行流:
+    1. 从VMRepresentation单例获取VM上下文(4个关键地址)
+    2. 若尚未设置(BADADDR) → 自动调用static_vmctx()发现
+    3. userchoice=True时弹出4个对话框让用户手动输入/修改地址
+    4. 调用deobfuscate()执行完整的反混淆流程
+
+    @param display 输出模式: 0=VmInstruction, 2=优化+CFG
+    @param userchoice 是否让用户手动输入VM上下文地址
     """
     vmr = get_vmr()
+    # 若VM上下文尚未初始化，先自动发现
     if vmr.code_start == BADADDR:
         try:
             vm_ctx = static_vmctx()
@@ -787,6 +940,7 @@ def static_deobfuscate(display=0, userchoice=False):
             print e.message
             print e.args
     if userchoice:
+        # 弹出对话框让用户确认/修改4个关键地址
         code_start = AskAddr(vmr.code_start, 'Choose start of byte code:')
         code_end = AskAddr(vmr.code_end, 'Choose end of byte code:')
         base_addr = AskAddr(vmr.base_addr, 'Coose start of jmp table:')
