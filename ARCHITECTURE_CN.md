@@ -450,3 +450,314 @@ VMRepresentation (单例)
 | 手动 | VM上下文(静态/动态) | 手动输入或半自动 | `static_vmctx()` / `dynamic_vmctx()` |
 | 手动 | 虚拟寄存器跟踪 | 需用户指定寄存器 | `manual_analysis(3)` |
 | 手动 | 地址计数 | 自动输出 | `address_heuristic()` |
+
+## 9. 静态反混淆详细流程 (static_deobfuscate.py)
+
+### 9.1 触发入口
+
+用户有三种方式触发静态反混淆，最终都会调用 `deobfuscate()`：
+
+```
+IDA 菜单                                       入口函数                    最终调用
+──────────────────────────────────────────────────────────────────────────────────────
+Semi Automated (static) / Static deobfuscate → static_deobfuscate(0)    → deobfuscate()
+Semi Automated (static) / Create VM-Graph    → static_deobfuscate(2)    → deobfuscate(display=2)
+Manual Analysis / Deobfuscate from ...       → static_deobfuscate(0,T)  → deobfuscate() (用户输入地址)
+Automated Analysis / Grading System          → grading_automaton()      → deobfuscate() (作为子流程)
+```
+
+### 9.2 核心编排函数 deobfuscate() 的 10 步流程
+
+```
+deobfuscate(code_saddr, base_addr, code_eaddr, vm_addr, display=4, real_start=0)
+│
+│ ┌─────────────────────────────────────────────────────────────────────┐
+│ │ Step 1: 环境初始化                                                   │
+│ └─────────────────────────────────────────────────────────────────────┘
+├─ set_dissassembly_type()
+│     检查 IDA 的 BADADDR 值:
+│     0xFFFFFFFFFFFFFFFF → 64位模式 → SV.ASSEMBLER_64
+│     其他               → 32位模式 → SV.ASSEMBLER_32
+│     影响: Instruction 的 distorm3 解码模式、跳转表项大小(4/8字节)等
+│
+│ ┌─────────────────────────────────────────────────────────────────────┐
+│ │ Step 2: 读取已有 IDA 注释（保留逆向工程师手动标注）                      │
+│ └─────────────────────────────────────────────────────────────────────┘
+├─ read_in_comments(code_saddr, code_eaddr)
+│     遍历字节码地址范围，读取 IDA 中的普通注释和可重复注释
+│     返回 List[(comment_text, address)]
+│     目的：保留逆向工程师之前手动写入的跳转目标注释（格式: "jumps to: 0xABCD"）
+│
+│ ┌─────────────────────────────────────────────────────────────────────┐
+│ │ Step 3: 确定函数入口地址                                              │
+│ └─────────────────────────────────────────────────────────────────────┘
+├─ find_start(code_saddr, code_eaddr)
+│     在字节码范围内搜索具有交叉引用(cross-reference)的地址
+│     若恰好找到 1 个引用点 → 即为函数入口
+│     若找不到或多于 1 个  → 回退使用 code_saddr
+│
+│ ┌─────────────────────────────────────────────────────────────────────┐
+│ │ Step 4: 提取 VM 函数入口的 push 序列（函数参数）                        │
+│ └─────────────────────────────────────────────────────────────────────┘
+├─ get_start_push(vm_addr)
+│     从 VM 函数起始地址开始，逐条反汇编 x86 指令（创建 Instruction 对象）
+│     直到遇到 "mov ebp, esp" — 表示进入 VM 主循环
+│     返回 List[Instruction]（通常是 push reg / push imm 序列）
+│
+├─ to_vpush(f_start_lst, start_addr)
+│     将入口 push 指令转换为 vpush 伪指令:
+│     - push reg  → vpush(REGISTER_T, reg_name, size)
+│     - push imm  → vpush(IMMEDIATE_T, value, size)
+│     - push mem  → vpush(MEMORY_T, mem_expr, size)
+│     - pushf     → vpushf(REGISTER_T, "flags", size)
+│     返回 List[PseudoInstruction]  ← 函数参数对应的伪指令
+│
+│ ┌─────────────────────────────────────────────────────────────────────┐
+│ │ Step 5: 字节码 → VmInstruction（核心反混淆）                           │
+│ └─────────────────────────────────────────────────────────────────────┘
+├─ first_deobfuscate(code_saddr, base_addr, code_eaddr)
+│     逐字节遍历 [code_saddr, code_eaddr]:
+│     │
+│     │ ① 读取当前地址的字节值作为字节码 (vc = Byte(addr))
+│     │
+│     │ ② 查跳转表获取 handler 地址
+│     │   calc_code_addr(vc, base):
+│     │     32位: handler_addr = Dword(vc × 4 + base)
+│     │     64位: handler_addr = Qword(vc × 8 + base)
+│     │
+│     │ ③ 反汇编 handler 的 x86 指令序列
+│     │   get_instruction_list(vc, base):
+│     │     从 handler_addr 开始，逐条创建 Instruction(addr, bytes)
+│     │     终止条件: 无条件跳转 → 丢弃(回到dispatch循环)
+│     │               ret       → 保留(VM函数返回)
+│     │     返回 List[Instruction]
+│     │
+│     │ ④ 检测 catch 指令（读取字节码流中的附加参数）
+│     │   遍历 List[Instruction], 调用 inst.is_catch_instr()
+│     │   如果找到 catch 指令:
+│     │     is_byte_mov()   → catch 1 字节, 总长度 = 2
+│     │     is_word_mov()   → catch 2 字节, 总长度 = 3
+│     │     is_double_mov() → catch 4 字节, 总长度 = 5
+│     │     is_quad_mov()   → catch 8 字节, 总长度 = 9
+│     │   没有 catch → 总长度 = 1（单字节操作码）
+│     │   ★ catch_value = 从下一字节开始读取对应长度的值
+│     │
+│     │ ⑤ 构造 VmInstruction
+│     │   VmInstruction(instr_lst, catch_value, catch_reg, inst_addr)
+│     │     内部流程:
+│     │     a) 将指令按 is_vinst() 分为 Vinstructions 和 Instructions
+│     │     b) get_pseudo_code() 按优先级尝试匹配 15 种虚拟指令
+│     │     c) 匹配成功 → 设置 self.Pseudocode = PseudoInstruction(...)
+│     │     d) replace_catch_reg() → 用 catch_value 替换 catch 寄存器
+│     │     e) 匹配失败 → Pseudocode = 原始助记符拼接（标记为 UNDEF_T）
+│     │
+│     │ ⑥ 控制流处理
+│     │   若识别为 vjmp 或 vret:
+│     │     检查下一地址是否有正常 x86 代码
+│     │     → 弹出对话框询问用户：是否继续反混淆该地址？
+│     │     → 若否：用户手动输入新的继续地址
+│     │     → 记录到 jump_dict 避免重复询问
+│     │
+│     │ curraddr += length（跳过 catch 参数占用的字节）
+│     │
+│     返回 List[VmInstruction]
+│
+│ ┌─────────────────────────────────────────────────────────────────────┐
+│ │ Step 6: VmInstruction → push/pop 伪指令表示                          │
+│ └─────────────────────────────────────────────────────────────────────┘
+├─ add_ret_pop(vm_inst_lst)
+│     处理 vret 指令：将其 handler 中的 pop 指令转为 vpop 伪指令
+│     （因为 vret 前有一系列 pop 恢复寄存器的操作）
+│     返回 List[PseudoInstruction]（包含所有 VmInstruction 的 Pseudocode）
+│
+├─ make_pop_push_rep()  ← 对每个 PseudoInstruction 调用
+│     将高级虚拟指令展开为 push/pop 序列:
+│     例: vadd(T1, T2) → vpop T1; vpop T2; vpush (T1 + T2); vpush flags
+│     引入临时变量 T_xx 使数据流显式化
+│     返回 List[PseudoInstruction]  ← push/pop 粒度
+│
+│ ┌─────────────────────────────────────────────────────────────────────┐
+│ │ Step 7: 跳转地址解析                                                 │
+│ └─────────────────────────────────────────────────────────────────────┘
+├─ get_jmp_addresses(push_pop_lst, code_eaddr)
+│     递归搜索跳转目标:
+│     1. 找到所有 JMP_T 类型的伪指令
+│     2. 对每个 jmp 指令，调用 start_rec() → rec_find_addr()
+│     3. rec_find_addr() 递归回溯数据流:
+│        - 操作数是立即数 → 直接作为跳转地址
+│        - 操作数是 vpop 的结果 → 找到对应的 vpush，追踪其操作数
+│        - 操作数是赋值结果 → 追踪赋值来源
+│        - 最大递归深度 20 层
+│     4. 如果跳转前有连续 push 立即数 → 可能是跳转表(2+个目标)
+│     返回 List[(jump_target_addr, jmp_instruction_addr)]
+│
+├─ get_jmp_input_found(cjmp_addrs, jmp_addrs)
+│     合并自动发现的跳转地址 与 逆向工程师手动标注的跳转地址
+│     手动标注优先（覆盖自动发现的结果）
+│
+│ ┌─────────────────────────────────────────────────────────────────────┐
+│ │ Step 8: 基本块划分                                                   │
+│ └─────────────────────────────────────────────────────────────────────┘
+├─ find_basic_blocks(push_pop_lst, start_addr, jmp_addrs)
+│     经典基本块划分算法:
+│     1. Leader 收集:
+│        - start_addr 是第一个 leader
+│        - 每个 JMP_T/RET_T 之后的指令是 leader
+│        - 每个跳转目标地址是 leader
+│     2. 排序去重 → 相邻 leader 构成 (start, end) 区间
+│     返回 List[(bb_start_addr, bb_end_addr)]
+│
+├─ color_basic_blocks(basic_blocks)
+│     在 IDA 中用 6 种颜色循环着色各基本块（视觉辅助）
+│
+├─ make_bb_lists(push_pop_lst, basic_blocks)
+│     按基本块边界将 push_pop_lst 切分为多个子列表
+│     返回 List[List[PseudoInstruction]]
+│
+│ ┌─────────────────────────────────────────────────────────────────────┐
+│ │ Step 9: 优化管线（对每个基本块独立执行）                                │
+│ └─────────────────────────────────────────────────────────────────────┘
+├─ optimize(basic_block_lst, has_loc)   ← 对每个基本块调用
+│     10 步优化管线（每步后调用 remove_dropped 清除标记删除的指令）:
+│
+│     ① replace_scratch_variables
+│        将栈暂存区偏移 ST_xx 替换为命名临时变量 T_xx
+│        原理: 跟踪 [ebp+offset] 的写入和读取，用 T_N 替代
+│
+│     ② replace_push_ebp
+│        识别 "push ebp" 模式 → 将关联的栈值聚合为数组操作数
+│        处理函数有局部变量(has_loc=True)的情况
+│
+│     ③ replace_pop_push
+│        匹配 push-pop 对 → 消除中间栈操作，转为直接赋值
+│        算法: 从 pop 向前搜索对应 push（计数配对）
+│
+│     ④ reduce_assignements
+│        赋值链消减: T2 = T1; T3 = T2  →  T3 = T1
+│        反复执行直到无变化
+│
+│     ⑤ convert_read_array
+│        将 vread 产生的数组操作数简化为直接赋值
+│
+│     ⑥ change_nor_to_not
+│        语义等价变换: vnor(a, a)  →  vnot(a)
+│
+│     ⑦ reduce_ret
+│        删除 vret 附近对即将丢弃的临时变量的赋值
+│
+│     ⑧ add_comments
+│        为疑似函数参数访问的指令添加 AOS 注释（启发式标注）
+│
+│     ⑨ count_left_push / count_left_pop
+│        计数剩余未消除的 push/pop 指令（诊断信息）
+│
+│     ⑩ delete_overwrote_st
+│        删除后续被覆盖的栈暂存区赋值（dead store elimination）
+│
+│ ┌─────────────────────────────────────────────────────────────────────┐
+│ │ Step 10: 输出展示                                                    │
+│ └─────────────────────────────────────────────────────────────────────┘
+├─ 根据 display 参数选择输出模式:
+│
+│   display=0: display_vm_inst()
+│     在 IDA 注释中显示原始 VmInstruction（最底层表示）
+│
+│   display=1: display_ps_inst()
+│     在 IDA 注释中显示 push/pop 伪指令（中间表示）
+│
+│   display>=2: display_ps_inst() + show_graph()
+│     在 IDA 注释中显示优化后伪指令
+│     构建控制流图:
+│       - 节点: 每个非空基本块 → "bb0", "bb1", ...
+│       - 边: 根据跳转地址连接基本块
+│         - 无 jmp → 顺序连接到下一个基本块
+│         - 有 jmp → 连接到所有可能的跳转目标
+│         - 有 ret → 无出边
+│       - 调用 BBGraphViewer.show_graph() 在 IDA 中渲染 CFG
+│
+└─ 返回 min_jmp: 所有跳转目标中的最小地址
+```
+
+### 9.3 迭代驱动 start()
+
+`deobfuscate()` 外层有一个 `start()` 函数驱动迭代：
+
+```
+start(code_saddr, base_addr, code_eaddr, vm_addr, display, real_start)
+│
+│  old_min = BADADDR
+│  n_min = code_saddr
+│
+│  while old_min > n_min:     ← 不断尝试更小的起始地址
+│      old_min = n_min
+│      n_min = deobfuscate(old_min, base_addr, code_eaddr, ...)
+│                                   ↑ 返回跳转目标的最小地址
+│  ★ 循环终止: 当没有发现更小的跳转目标时（说明所有字节码已覆盖）
+```
+
+这个机制解决了 VM 字节码中存在**前向跳转**的情况：第一轮可能只处理了部分字节码，但发现有跳转指向更前面的地址，于是从该地址重新开始处理。
+
+### 9.4 VM 上下文自动发现 static_vmctx()
+
+静态反混淆依赖 4 个关键地址（VMContext），`static_vmctx()` 尝试自动发现它们：
+
+```
+static_vmctx()
+│
+├─ 1. 查找 .vmp 段
+│     遍历 IDA 段表，寻找名称以 ".vmp" 开头的段
+│     获取 vm_seg_start 和 vm_seg_end
+│
+├─ 2. 查找 VM 函数 (vm_addr)
+│     在 .vmp 段内找到最大的函数 → 认定为 VM 解释器主函数
+│     原理: VM dispatch 循环通常是段内最大的函数
+│
+├─ 3. 查找跳转表基址 (base_addr)
+│     从 vm_addr 开始向下搜索 jmp 指令
+│     匹配模式: jmp [off_XXXXXXXX + reg*scale]
+│     提取 off_XXXXXXXX 即为跳转表基址
+│     若匹配失败 → 弹出对话框请用户手动输入
+│
+├─ 4. 查找字节码范围 (code_start, code_end)
+│     code_end = vm_seg_end
+│     code_start = 从段尾向前搜索，找到第一条 jmp 指令的下一地址
+│     原理: 字节码通常位于 .vmp 段末尾，紧接在最后一条 jmp 之后
+│
+└─ 写入 VMRepresentation 单例
+      vmr.vm_ctx = VMContext(code_start, code_end, base_addr, vm_addr)
+```
+
+### 9.5 数据转换链完整示例
+
+以一条 `vadd` 虚拟指令为例，展示从原始字节码到最终优化伪指令的转换过程：
+
+```
+第一层: 原始字节码
+  地址 0x4000: 字节码值 0x3A
+
+第二层: 跳转表查找
+  handler_addr = Dword(0x3A * 4 + base_addr) = 0x401234
+
+第三层: handler 反汇编 → List[Instruction]
+  0x401234: mov eax, [ebp]      ← Instruction #1 (is_read_stack → vpop 特征)
+  0x401237: add ebp, 4           ← Instruction #2 (is_add_basepointer → vpop 特征)
+  0x40123A: add [ebp], eax       ← Instruction #3 (add 非立即数 → vadd 特征)
+  0x40123D: pushfd               ← Instruction #4 (保存标志位)
+  0x40123E: pop [ebp-4]          ← Instruction #5 (标志位写入VM栈)
+  0x401241: sub ebp, 4           ← Instruction #6
+  0x401244: jmp dispatch         ← Instruction #7 (丢弃，回到dispatch)
+
+第四层: VmInstruction 模式匹配
+  识别为 vadd:
+    Pseudocode = PseudoInstruction('vadd', 0x4000, [op_eax, op_ebp_mem])
+
+第五层: make_pop_push_rep() 展开
+  vpop  T_1        ; 弹出第一个操作数
+  vpop  T_2        ; 弹出第二个操作数
+  vpush (T_1+T_2)  ; 压入加法结果
+  vpush flags      ; 压入标志位
+
+第六层: optimize() 优化
+  经过赋值消减、scratch 替换等优化后:
+  T_3 = T_1 + T_2  ; 最终简洁表示
+```
