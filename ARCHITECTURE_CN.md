@@ -761,3 +761,177 @@ static_vmctx()
   经过赋值消减、scratch 替换等优化后:
   T_3 = T_1 + T_2  ; 最终简洁表示
 ```
+
+## 10. Trace 数据流详解：从采集到优化
+
+### 10.1 Trace 数据结构
+
+```python
+Trace (继承自 list)
+├── List[Traceline]         # 指令序列（按执行顺序排列）
+├── ctx_reg_size            # 寄存器宽度: 32 或 64
+└── 5个优化状态标志位
+    ├── constant_propagation    = False  # 常量传播已执行？
+    ├── stack_addr_propagation  = False  # 栈地址传播已执行？
+    ├── standardization         = False  # 操作标准化已执行？
+    ├── operand_folding         = False  # 无用操作数折叠已执行？
+    └── peephole                = False  # 窥孔优化已执行？
+
+Traceline
+├── thread_id   # int    — 线程ID
+├── addr        # int    — 指令地址 (如 0x401000)
+├── disasm      # list   — 标准化反汇编 ['mov', 'eax', '[ebp+8]']
+├── ctx         # dict   — 执行后的全部CPU寄存器值 {'eax':'1A2B', 'ebx':'0', ...}
+├── comment     # str    — 分析注释（优化/分析时填充）
+└── grade       # int    — 评分值（grading_automaton 使用）
+```
+
+注意：ctx 中的值是**字符串形式十六进制**（无 0x 前缀），由 `IDADebugger.convert()` 用 `'%x' % int(value)` 生成。
+
+### 10.2 Trace 的两种获取方式
+
+#### 方式一：IDA 调试器实时采集
+
+```
+用户菜单 "Generate Trace"
+    │
+    ▼
+gen_instruction_trace(choice)
+    │
+    ├─ get_dh(choice) → DebuggerHandler 单例
+    │
+    └─ DebuggerHandler.gen_instruction_trace()
+        │
+        ├─ self.dbg.hook_dbg()     ← 注册 IDA 调试回调
+        └─ self.dbg.gen_trace()    ← 启动调试执行
+              │
+              ├─ trace_init()      ← 创建空 Trace(reg_size=32/64)
+              ├─ RunTo(BeginEA())  ← 运行到入口
+              ├─ EnableTracing(TRACE_STEP, 1) ← 开启单步跟踪
+              │
+              │  ┌── IDA 调试事件循环 ──────────────────────┐
+              │  │ 每执行一条指令 → dbg_trace(tid, ea) 回调  │
+              │  │   ① 读取 CPU 全部寄存器 → ctx 字典       │
+              │  │   ② 反汇编 GetDisasm(ea) → disconv() 标准化│
+              │  │   ③ self.trace.append(Traceline(         │
+              │  │        thread_id, addr, disasm, ctx))    │
+              │  └──────────────────────────────────────────┘
+              │
+              ├─ 修正 ctx 偏移
+              │   dbg_trace 返回的是执行前的上下文
+              │   → 将每行 ctx 替换为下一行的 ctx（即执行后状态）
+              │
+              └─ return trace → vmr.trace = trace
+```
+
+核心回调 `IDADebugger.dbg_trace()` 在每次单步时被 IDA 触发：
+- 32位模式读取：eax/ebx/ecx/edx/ebp/esp/eip/edi/esi + 7个标志位
+- 64位模式额外读取：r8-r15、rax/rbx/... 替代 eax/ebx/...
+
+#### 方式二：从文件加载
+
+```
+用户菜单 "Load Trace"
+    │
+    └─ DebuggerHandler.load()
+        │
+        ├─ 弹出文件选择对话框 (支持 .txt 和 .json)
+        │
+        ├─ 根据文件格式解析（4种格式）：
+        │   ├─ .json (VMAttack自有格式)
+        │   │     直接反序列化字典 → Traceline 列表
+        │   │     保留 comment 和 grade 字段
+        │   │
+        │   ├─ .txt (IDA Win32Dbg trace)
+        │   │     以 "Thread xxx" 开头
+        │   │     TSV 格式: thread_id \t segment:addr \t disasm \t regs
+        │   │     地址解析支持: 绝对地址/函数名+偏移/loc_标签
+        │   │
+        │   ├─ Immunity Debugger trace
+        │   │     以 "Address\t" 开头
+        │   │     thread_id 用函数名的字符码之和代替
+        │   │
+        │   └─ OllyDbg trace
+        │         以 "main\t" 开头，格式类似 Immunity
+        │
+        ├─ 自动检测 32/64 位
+        │   最后一行 ctx 中有 'rax' → 64 位
+        │   有 'eax' 无 'rax'     → 32 位
+        │
+        └─ return trace → vmr.trace = trace
+```
+
+### 10.3 从全局状态到优化函数的流转
+
+```
+vmr.trace (全局原始数据，由采集/加载写入)
+    │
+    └─ prepare_trace()
+        return deepcopy(vmr.trace)  ← ★ 每次分析都深拷贝，保护原始数据
+            │
+            │  ┌──────────────────────────────────────────────────────────┐
+            │  │ 所有分析/优化操作都在副本上进行，互不影响               │
+            │  └──────────────────────────────────────────────────────────┘
+            │
+            ├─→ grading_automaton() 评分系统
+            │     阶段3: optimization_const_propagation(trace)
+            │     阶段3: optimization_stack_addr_propagation(trace)
+            │     阶段8: optimize(deepcopy(trace))  ← 再次深拷贝
+            │
+            ├─→ clustering_analysis() 聚类分析
+            │     optimization_const_propagation(trace)
+            │     optimization_stack_addr_propagation(trace)
+            │     repetition_clustering(deepcopy(trace))
+            │
+            ├─→ input_output_analysis() I/O分析
+            │     多线程并行:
+            │       DynamicAnalyzer(find_input, trace)
+            │       DynamicAnalyzer(find_output, trace)
+            │       DynamicAnalyzer(find_virtual_regs, trace)
+            │
+            ├─→ optimization_analysis() 优化分析
+            │     OptimizationViewer(trace, save=save)
+            │     用户在UI中手动选择执行哪些优化
+            │
+            └─→ address_heuristic() 地址频率统计
+                  address_count(deepcopy(trace))
+```
+
+### 10.4 优化状态标志的使用
+
+每个优化函数执行后设置对应标志位为 True，调用方通过标志位避免重复执行：
+
+```python
+# clustering_analysis() 中的典型用法
+if not trace.constant_propagation:       # 尚未执行常量传播？
+    trace = optimization_const_propagation(trace)    # 执行
+# 此后 trace.constant_propagation == True
+
+if not trace.stack_addr_propagation:     # 尚未执行栈地址传播？
+    trace = optimization_stack_addr_propagation(trace)
+```
+
+完整的 5 种优化执行顺序（由 `optimize()` 函数驱动）：
+
+```
+optimizations = [
+    optimization_const_propagation,        # ① 常量传播（传播型，安全）
+    optimization_stack_addr_propagation,   # ② 栈地址传播（传播型，安全）
+    optimization_standard_ops_folding,     # ③ 操作标准化（折叠型，需谨慎）
+    optimization_unused_operand_folding,   # ④ 无用操作数折叠（折叠型，需谨慎）
+    optimization_peephole_folding          # ⑤ 窥孔优化（折叠型，需谨慎）
+]
+```
+
+### 10.5 深拷贝隔离策略
+
+项目中大量使用 `deepcopy` 来隔离数据，这是一个重要的设计决策：
+
+| 场景 | deepcopy 层级 | 目的 |
+|------|-------------|------|
+| `prepare_trace()` | 从 vmr.trace 拷贝 | 保护全局原始 trace 不被分析修改 |
+| `DynamicAnalyzer.__init__()` | 入参 trace 再拷贝 | 多线程间互不干扰 |
+| `grading_automaton` 阶段8 | trace 再拷贝 | 优化不影响评分阶段的 trace |
+| `find_input/output/virtual_regs` | 调用时 deepcopy | 各分析独立运行 |
+
+这意味着即使优化函数会修改 Traceline 的 disasm、comment 字段，或直接删除行（折叠型优化），原始数据始终安全。
