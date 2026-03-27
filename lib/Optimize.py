@@ -25,9 +25,14 @@ from lib.Register import (get_reg_class, get_reg_by_size)
 
 def remove_dropped(ps_lst):
     """
-    @brief Removes every item of ps_lst which is marked to drop
-    @param ps_lst List of PseudoInstructions
-    @return List of PseudoInstructions
+    从伪指令列表中剔除所有已设置 drop 标记的项，并返回新列表。
+
+    各优化步骤通常只将无用指令标为 drop，本函数负责真正收缩列表并释放对象。
+    优化管线中在多个步骤之间及末尾多次调用（如第1步后、第2步后等），
+    不属于单独的“第 N 步”优化规则，而是贯穿管线的清理例程。
+
+    @param ps_lst: 伪指令列表
+    @return: 不含 drop 项的新列表
     """
     ret = []
     for item in ps_lst:
@@ -40,11 +45,16 @@ def remove_dropped(ps_lst):
 
 def find_last_inst(pp_lst, start_pos, op):
     """
-    @brief Finds last instruction which has an operand that is equal to op
-    @param pp_lst List of PseudoInstructions push/pop represtentation
-    @param start_pos Startindex for searching
-    @param op Operand that must be found
-    @return Found index
+    从 start_pos 起向前（索引递减）查找最近一次“定义或使用”操作数 op 的指令位置。
+
+    原理：沿 push/pop 表示向前扫描；若遇到 POP 且目的操作数为 op，或遇到赋值类指令
+    且 op 出现在操作数列表中，则认定找到数据来源。用于跳转目标地址的数据流回溯。
+    不在 optimize 十步管线内；由 rec_find_addr / 跳转分析链路调用。
+
+    @param pp_lst: push/pop 形式的伪指令序列
+    @param start_pos: 搜索起始下标（从此处向前）
+    @param op: 要匹配的操作数
+    @return: 找到的下标，未找到则 None
     """
     pos = start_pos
     while pos != 0:
@@ -61,10 +71,15 @@ def find_last_inst(pp_lst, start_pos, op):
 
 def start_rec(pp_lst, jmp_pos):
     """
-    @brief Starts recursiv search for jmp addresses
-    @param pp_lst List of PseudoInstructions push/pop represtentation
-    @param jmp_pos Index of jump instruction
-    @return List of Tuple: (position of jump addr, address of jump instruction)
+    对位于 jmp_pos 的跳转指令，启动递归数据流分析以定位“计算跳转目标”相关的指令位置。
+
+    以跳转指令的第一个操作数为起点调用 rec_find_addr，再将得到的每个位置与
+    该跳转指令的地址组成 (pos, jmp_inst.addr) 元组列表返回。
+    不在 optimize 十步管线内；由 get_jmp_addresses 在静态反混淆流程中调用。
+
+    @param pp_lst: push/pop 形式的伪指令序列
+    @param jmp_pos: 跳转指令在列表中的下标
+    @return: [(与目标相关的指令下标, 跳转指令地址), ...]
     """
     jmp_inst = pp_lst[jmp_pos]
     if jmp_inst.list_len == 0:
@@ -80,12 +95,18 @@ def start_rec(pp_lst, jmp_pos):
 
 def rec_find_addr(pp_lst, pos, op, max_rec_depth):
     """
-    @brief Recursiv search for finding jmp addresses
-    @param pp_lst List of PseudoInstructions push/pop represtentation
-    @param pos Index of jump instruction
-    @param op Operand of jump instruction
-    @param max_rec_depth Maximal recursion depth
-    @return List positions which are used to calc jump address
+    递归回溯数据流，收集用于计算当前跳转目标操作数 op 的指令下标集合。
+
+    原理：若 op 已为立即数或与 ebp 同类的帧指针寄存器，则终止并返回当前 pos；
+    否则用 find_last_inst 找上游定义。对 POP 则配对 last_rel_push 继续追 push 源；
+    对二元/多元赋值则向右操作数递归（深度受 max_rec_depth 限制）。
+    不在 optimize 十步管线内；为 get_jmp_addresses 的核心子过程。
+
+    @param pp_lst: push/pop 形式的伪指令序列
+    @param pos: 当前考察的指令下标
+    @param op: 当前追踪的操作数
+    @param max_rec_depth: 最大递归深度，防止无限回溯
+    @return: 参与目标地址计算的指令下标列表
     """
     if max_rec_depth == 0:
         return []
@@ -122,10 +143,16 @@ def rec_find_addr(pp_lst, pos, op, max_rec_depth):
 
 def get_jmp_addresses(pp_lst, code_eaddr):
     """
-    @brief Determines the jump addresses of all jump instructions
-    @param pp_lst List of PseudoInstructions push/pop represtentation
-    @param code_eaddr End address of obfuscated code
-    @return List of Tuples: (jump addres, address of jump instruction)
+    枚举序列中所有跳转指令，并尽可能解析出其目标地址，同时给各 JMP 写注释。
+
+    原理：对每个 JMP 调用 start_rec 得到候选位置；若对应操作为寄存器则向前收集
+    连续立即数 PUSH 作为多目标；若为落在典型代码段的立即数则直接记为地址。
+    code_eaddr 当前实现中未参与判定，保留为接口。不在 optimize 十步管线内；
+    在静态反混淆主流程中先于 find_basic_blocks 调用。
+
+    @param pp_lst: push/pop 形式的伪指令序列
+    @param code_eaddr: 混淆代码区结束地址
+    @return: [(跳转目标地址, 跳转指令地址), ...]
     """
     jp_lst = []
     for pos, inst in enumerate(pp_lst):
@@ -175,11 +202,16 @@ def get_jmp_addresses(pp_lst, code_eaddr):
 
 def find_basic_blocks(pp_lst, start_addr, jmp_addrs):
     """
-    @brief Determines which parts are basic blocks
-    @param pp_lst List of PseudoInstructions push/pop represtentation
-    @param start_addr Start address of obfuscated function
-    @param jmp_addrs List of Tuples:(jump address, address of jump instruction)
-    @return List of Tuples:(basic block start address, basic block end address)
+    用经典 leader 算法根据入口点划分基本块，返回各块 [起始地址, 结束地址) 区间。
+
+    原理：首指令地址与每个 JMP/RET 之后的第一条指令地址、以及 jmp_addrs 中的
+    跳转目标地址均作为 leader；排序去重后相邻 leader 构成一块。若无任何块则返回 None。
+    不在 optimize 十步管线内；在静态反混淆中在 get_jmp_addresses 之后用于控制流结构化。
+
+    @param pp_lst: push/pop 形式的伪指令序列
+    @param start_addr: 函数（或代码区）起始地址
+    @param jmp_addrs: get_jmp_addresses 得到的 (目标地址, 跳转指令地址) 列表
+    @return: [(块起始, 块结束), ...] 或 None
     """
     leader_lst = []
     leader_lst.append(start_addr)
@@ -210,10 +242,15 @@ def find_basic_blocks(pp_lst, start_addr, jmp_addrs):
 # still not sure if this is right for evry possibility
 def last_rel_push(ps_lst, pos):
     """
-    @brief Detrmines the corresponding 'push' to a 'pop' at position pos
-    @param ps_lst List of PseudoInstructions
-    @param pos Positon of 'pop' instruction
-    return Position of 'push' instruction
+    在给定位置 pos（通常为某条 POP）之前，用栈深度计数匹配与之配对的最近一条 PUSH。
+
+    原理：从 pos 向前遍历，POP 增加“待平衡”栈量（按 size），PUSH 减少；当计数回到 0
+    时的 PUSH 即为与当前 POP 在栈语义上配对的那条。用于跳转回溯与 replace_push_ebp 的栈扫描。
+    optimize 第2步（replace_push_ebp）及 rec_find_addr 会间接使用；非独立管线步骤。
+
+    @param ps_lst: 伪指令列表
+    @param pos: 参考位置（一般为 POP 的下标）
+    @return: 配对 PUSH 的下标，无法配对则 None
     """
     counter = 0
     while pos >= 0:
@@ -236,11 +273,18 @@ def last_rel_push(ps_lst, pos):
 
 def optimize(pseudo_inst_lst, has_loc):
     """
-    @brief Starts all optimization functions;
-    optimizes the output
-    @param pseud_inst_lst List of PseudoInstructions
-    @param has_loc Indicates if there are locals in this function
-    @return List of optimized PseudoInstructions
+    对反混淆得到的伪指令序列执行完整十步优化管线并返回最终列表。
+
+    执行顺序与模块文档一致：①replace_scratch_variables → ②replace_push_ebp →
+    ③replace_pop_push → ④reduce_assignements（中间穿插 remove_dropped）→
+    ⑤convert_read_array → 再次 reduce_assignements → ⑥change_nor_to_not →
+    ⑦reduce_ret → ⑧add_comments → ⑨count_left_push / count_left_pop →
+    ⑩delete_overwrote_st，最后 remove_dropped。return_push_ebp、scan_for_arguments
+    在代码中注释掉，默认不执行。
+
+    @param pseudo_inst_lst: 伪指令列表（原地修改并可能被步骤替换为新列表）
+    @param has_loc: 当前函数是否含局部变量（影响 replace_push_ebp 是否附加 RET_ADDR/ARGS）
+    @return: 优化并剔除 drop 后的伪指令列表
     """
     replace_scratch_variables(pseudo_inst_lst)
     pseudo_inst_lst = replace_push_ebp(pseudo_inst_lst, has_loc)
@@ -274,8 +318,12 @@ def optimize(pseudo_inst_lst, has_loc):
 #think about saving the offsets of edi in Variable_T
 def replace_scratch_variables(ps_lst):
     """
-    @brief Replaces scratch variables with temporal variables
-    @param ps_lst List of PseudoInstructions
+    将栈暂存区操作数 ST_xx 与对应 PUSH 上的同名操作数统一替换为临时变量 T_xx（VARIABLE_T）。
+
+    原理：对每个目标为 SVARIABLE 的 POP，向前扫描 PUSH，通过 replace_st_push 替换同名
+    scratch，再把该 POP 左端改为新的 VariableOperand。优化管线第 1 步。
+
+    @param ps_lst: 伪指令列表（原地修改）
     """
     for pos, item in enumerate(ps_lst):
         if item.list_len <= 0:
@@ -290,14 +338,17 @@ def replace_scratch_variables(ps_lst):
 
 def replace_st_push(ps_lst, pos, to_replace, replace):
     """
-    @brief Replaces scratch operand to_replace with operand replace
-    in every 'push' instruction until next 'pop' instruction
-    with scratch operand to_replace
-    @param ps_lst List of PseudoInstructions
-    @param pos Starting postion for replacement
-    @param to_replace Scratch operand that will be replaced
-    @param replace Varibale operand which replaces to_replace
-    @return True if a replacement took place, False otherwise
+    从 pos 之后顺序扫描，把所有 PUSH 上等于 to_replace 的操作数改为 replace，直到遇到
+    下一个左操作数仍为 to_replace 的 POP 为止。
+
+    用于保证同一 scratch 在一次 pop 定义作用域内的 push 源一致。优化管线第 1 步中
+    replace_scratch_variables 的辅助函数。
+
+    @param ps_lst: 伪指令列表
+    @param pos: 起始下标（通常为当前 POP 的位置）
+    @param to_replace: 被替换的栈暂存操作数
+    @param replace: 替换后的变量操作数
+    @return: 是否至少发生一次 PUSH 替换
     """
     lst_len = len(ps_lst)
     is_replace = False
@@ -320,13 +371,17 @@ def replace_st_push(ps_lst, pos, to_replace, replace):
 
 def search_last_inst(count, ps_lst, last_pos, instruction_flag):
     """
-    @brief Determines the last count instructions
-    with the flag instruction_flag
-    @param count Number of last instructions that should be found
-    @param ps_lst List of PseudoInstructions
-    @param last_pos Last position to search
-    @param instruction_flag Flag that defines a instruction
-    @return List of indices or None
+    在 [0, last_pos) 范围内，找出最近 count 条 inst_type 等于 instruction_flag
+    且未 drop 的指令下标。
+
+    原理：顺序扫描并用长度为 count 的循环缓冲区保留最后若干匹配位置；若匹配不足
+    count 条则返回 None。供 replace_pop_push 定位配对 PUSH。优化管线第 3 步的辅助函数。
+
+    @param count: 需要匹配的条数
+    @param ps_lst: 伪指令列表
+    @param last_pos: 扫描上界（不含）
+    @param instruction_flag: 指令类型标志（如 PI.PUSH_T）
+    @return: 长度为 count 的下标列表（顺序与实现相关），不足则 None
     """
     i = 0
     ret = []
@@ -348,7 +403,12 @@ def search_last_inst(count, ps_lst, last_pos, instruction_flag):
 
 def size_to_str(size):
     """
-    @brief Determines a string representation for a given size
+    将操作数字节宽度映射为后缀字母，用于 push/pop 部分宽度拆分时的临时操作数命名。
+
+    映射：1→b，2→w，4→d，8→q；其它返回空串。优化管线第 3 步（replace_pop_push）中使用。
+
+    @param size: 字节大小
+    @return: 单字符后缀或空字符串
     """
     lookup = {1:'b', 2:'w', 4:'d', 8:'q'}
     try:
@@ -359,12 +419,15 @@ def size_to_str(size):
 
 def is_mov_ebp(ps_lst, start, end):
     """
-    @brief Determines if a mov ebp instruction is between
-    start and end
-    @param ps_lst List of PseudoInstructions
-    @param start Startposition in ps_lst for search
-    @param end Endposition in ps_lst for search
-    @return True if mov ebp instruction is found, False otherwise
+    判断闭区间 [start, end] 内是否存在 MOV_EBP 类指令（栈帧/setup 语义断点）。
+
+    若存在则禁止将区间内 PUSH-POP 安全合并为赋值，以免破坏帧指针相关约定。
+    优化管线第 3 步（replace_pop_push）的守卫条件。
+
+    @param ps_lst: 伪指令列表
+    @param start: 起始下标
+    @param end: 结束下标
+    @return: 是否存在 mov ebp
     """
     currpos = start
     while currpos <= end:
@@ -378,12 +441,15 @@ def is_mov_ebp(ps_lst, start, end):
 
 def is_undef_inst(ps_lst, start, end):
     """
-    @brief Determines if a undefined instruction is between
-    start and end
-    @param ps_lst List of PseudoInstructions
-    @param start Startposition in ps_lst for search
-    @param end Endposition in ps_lst for search
-    @return True if undefined instruction is found, False otherwise
+    判断闭区间 [start, end] 内是否存在未定义（UNDEF）伪指令。
+
+    中间若有未定义指令则 PUSH-POP 数据流不可靠，replace_pop_push 跳过合并。
+    优化管线第 3 步的守卫条件。
+
+    @param ps_lst: 伪指令列表
+    @param start: 起始下标
+    @param end: 结束下标
+    @return: 是否存在未定义指令
     """
     currpos = start
     while currpos <= end:
@@ -397,9 +463,14 @@ def is_undef_inst(ps_lst, start, end):
 
 def replace_pop_push(ps_lst):
     """
-    @brief Replaces push- pop pairs with assignements
-    @param ps_lst List of PseudoInstructions
-    @return List of PseudoInstructions
+    将可安全配对的 PUSH-POP 消除为直接赋值（目的操作数 = 源操作数），并处理宽度不一致情况。
+
+    原理：对每个 POP 用 search_last_inst 找最近 PUSH；若无 mov_ebp/undef 阻隔且宽度匹配
+    则双方 drop 并生成 ASSIGNEMENT；宽度不等时拆分为 _PART 后缀的多个赋值或多次 PUSH 合并。
+    优化管线第 3 步。
+
+    @param ps_lst: 伪指令列表
+    @return: 新的伪指令列表（含新生成的赋值指令）
     """
     ret = []
     rest_size = None
@@ -474,12 +545,18 @@ def replace_pop_push(ps_lst):
 # TODO verbessern
 def replace_temporals(ps_lst, pos, to_replace, replace):
     """
-    @brief Replaces temporal operand to_replace with operand replace
-    @param ps_lst List of PseudoInstructions
-    @param pos Starting postion for replacement
-    @param to_replace Scratch operand that will be replaced
-    @param replace Varibale operand which replaces to_replace
-    @return True if a replacement took place, False otherwise
+    从 pos+1 起向后传播替换：将所有引用 to_replace 的地方改为 replace，直至遇到对
+    to_replace 的重新定义（赋值左值）等终止条件。
+
+    会深入 ARRAY 内元素；POINTER 类型单独构造新操作数。若首遇“对 to_replace 的赋值”
+    且为 NOTHING 赋值类则返回 False 以避免错误删除。优化管线第 4 步 reduce_assignements
+    的辅助函数。
+
+    @param ps_lst: 伪指令列表
+    @param pos: 当前赋值指令位置（从此之后开始替换）
+    @param to_replace: 被消去的临时操作数
+    @param replace: 替换为的操作数
+    @return: 是否发生了替换
     """
     lst_len = len(ps_lst)
     counter = pos + 1
@@ -512,9 +589,13 @@ def replace_temporals(ps_lst, pos, to_replace, replace):
 
 def reduce_assignements(ps_lst):
     """
-    @brief Reduces assignements e.g.:
-    converts 'T2 = T1' and 'T3 = T2' to 'T3 = T1'
-    @param ps_lst List of PseudoInstructions
+    对形如 T_a = T_b 的简单赋值链做传递闭包式消减，例如 T2=T1 与 T3=T2 合并为对 T3=T1 的等价使用。
+
+    原理：遍历 NOTHING 类的 VARIABLE 左值赋值，调用 replace_temporals 把后续对左值的
+    引用替换为右值；成功则标记当前赋值为 drop。在管线中第 5 步前后各执行一次以配合
+    convert_read_array。优化管线第 4 步（并在第 5 步后再跑一次）。
+
+    @param ps_lst: 伪指令列表（原地修改）
     """
     for pos, item in enumerate(ps_lst):
         if (item.inst_class == PI.ASSIGNEMENT_T
@@ -530,12 +611,16 @@ def reduce_assignements(ps_lst):
 
 def find_further_result_op(ps_lst, start_pos, end_pos, op):
     """
-    @brief Finds all assignements to op
-    @param ps_lst List of PseudoInstructions
-    @param start_pos Position to start searching
-    @param end_pos Position to end searching
-    @param op Operand for searching
-    @return Returns poistion of all found assignements
+    从 start_pos 起向右连续扫描赋值指令，收集所有左值等于 op 的赋值下标。
+
+    遇到非赋值类指令即停止。供 reduce_ret 识别 vret 前对同一“结果操作数”的多次赋值。
+    优化管线第 7 步（reduce_ret）的辅助函数。
+
+    @param ps_lst: 伪指令列表
+    @param start_pos: 起始下标
+    @param end_pos: 结束下标
+    @param op: 要匹配左值的操作数
+    @return: 赋值位置下标列表
     """
     positions = []
     pos = start_pos
@@ -551,9 +636,12 @@ def find_further_result_op(ps_lst, start_pos, end_pos, op):
 # need further testing
 def reduce_ret(ps_lst):
     """
-    @brief Marks all unnecessary assignemnets related to
-    'ret' instruction for deletion
-    @param ps_lst List of PseudoInstructions
+    在 RET 指令地址处开始，将紧挨在返回前的连续赋值中冗余的“弹栈式”赋值标为 drop。
+
+    原理：对同一左值的多次赋值仅保留最后一次，之前的标记删除；左值与右值同名
+    的无意义赋值亦删除。优化管线第 7 步。
+
+    @param ps_lst: 伪指令列表（原地修改 drop）
     """
     for item in ps_lst:
         if(item.inst_type == PI.RET_T):
@@ -587,10 +675,14 @@ def reduce_ret(ps_lst):
 
 def replace_push_ebp(ps_lst, has_loc):
     """
-    @brief Replaces all 'push ebp' or 'push rbp' with array operands
-    @param List of PseudoInstructions
-    @param has_loc Indicates if there are locals in this function
-    @return List of PseudoInstructions
+    将 push ebp/rbp 与其栈上关联的一组 push 值聚合为单个 ARRAY 操作数，便于后续按数组下标理解栈帧。
+
+    原理：用 scan_stack 收集两枚 ebp push 之间的 push 序列，按是否含 ret、是否 mov_ebp、
+    has_loc 决定是否追加 RET_ADDR、ARGS 占位表达式。优化管线第 2 步。
+
+    @param ps_lst: 伪指令列表
+    @param has_loc: 是否存在局部变量
+    @return: 替换后的新伪指令列表
     """
     ret = []
     is_ret = False
@@ -646,10 +738,12 @@ def replace_push_ebp(ps_lst, has_loc):
 #just do this after reduction
 def return_push_ebp(ps_lst):
     """
-    @brief Replace all array operands, which are not part of an assignement,
-    with 'push ebp' or 'push rbp'
-    @param ps_lst List of PseudoInstructions
-    @remark Just do this after 'replace_push_ebp' and 'reduce_assignements'
+    将仍为 PUSH 且操作数为 ARRAY 的指令还原为普通的 push ebp/rbp（按当前反汇编位宽选寄存器）。
+
+    适用于在 replace_push_ebp 与赋值消减之后再恢复更接近原始汇编的形态。
+    当前 optimize 中该调用被注释掉，未接入十步管线；若启用应放在聚合与消减之后。
+
+    @param ps_lst: 伪指令列表（原地修改）
     """
     for inst in ps_lst:
         if (inst.inst_type == PI.PUSH_T and
@@ -664,11 +758,14 @@ def return_push_ebp(ps_lst):
 # get pushes that are on stack between two push ebp
 def scan_stack(ps_lst, s_pos):
     """
-    @brief Determines which values are on the stack at a
-    given 'push ebp' instruction
-    @param ps_lst List of PseudoInstructions
-    @param s_pos Postion of 'push ebp' or 'push rbp' instruction
-    @return List of Postions
+    在给定 push ebp/rbp 位置 s_pos，自外向内列出“当前栈上”对应的各 PUSH 指令下标。
+
+    原理：反复 last_rel_push 向前找配对 push，直到区间内出现 mov_ebp 为止并从列表移除
+    该位置。优化管线第 2 步中 replace_push_ebp 使用。
+
+    @param ps_lst: 伪指令列表
+    @param s_pos: 当前 push ebp 的下标
+    @return: 从栈顶到帧方向相关的 push 下标列表
     """
     a = last_rel_push(ps_lst, s_pos-1)
     pos_lst = []
@@ -688,10 +785,13 @@ def scan_stack(ps_lst, s_pos):
 
 def convert_read_array(ps_lst):
     """
-    @brief Converts a 'vread' of an array operand to
-    an assignement
-    @param ps_lst List of PseudoInstructions
-    @return List of PseudoInstructions
+    将右端为数组操作数的 READ 类赋值（vread）简化为普通赋值：左值 = 数组的第一个元素。
+
+    仅处理 list_len==2、ASSIGNEMENT 且 inst_type 为 READ、右操作数为 ARRAY 的情况。
+    优化管线第 5 步。
+
+    @param ps_lst: 伪指令列表
+    @return: 转换后的新列表
     """
     ret = []
     for inst in ps_lst:
@@ -717,9 +817,12 @@ def convert_read_array(ps_lst):
 
 def change_nor_to_not(ps_lst):
     """
-    @brief Converts a 'vnor' with two equal operands to a 'not'
-    @param ps_lst List of PseudoInstructions
-    @return List of PseudoInstructions
+    当 vnor 的两个源操作数相同（a NOR a）时，改写为语义等价的 vnot 单操作赋值。
+
+    利用恒等式 NOR(x,x) = NOT(x)。优化管线第 6 步。
+
+    @param ps_lst: 伪指令列表
+    @return: 替换后的新列表
     """
     ret = []
     for inst in ps_lst:
@@ -746,8 +849,12 @@ def change_nor_to_not(ps_lst):
 # to an argument
 def scan_for_arguments(ps_lst):
     """
-    @brief Searches for access to arguments
-    @param ps_lst List of PseudoInstructions
+    扫描“数组指针 + 立即数偏移”的 ADD 赋值，若偏移超过数组元素覆盖范围则注释提示可能访问参数。
+
+    假设：对数组指针做加法且位移出已知栈数组可能指向调用参数区。optimize 中该步骤
+    被注释掉，未接入十步管线；逻辑与 add_comments 部分相似但判定更宽。
+
+    @param ps_lst: 伪指令列表（原地写 comment）
     """
     for inst in ps_lst:
         if (inst.inst_type == PI.ADD_T and
@@ -769,8 +876,12 @@ def scan_for_arguments(ps_lst):
 
 def add_comments(ps_lst):
     """
-    @brief Adds comments to some instructions
-    @param ps_lst List of PseudoInstructions
+    为疑似通过数组基址访问函数参数（或前驱基本块/局部）的 ADD 指令添加 AOS 风格注释。
+
+    原理：识别 ASSIGNEMENT + ADD 且同时含 ARRAY 与立即数；根据数组是否含 EXP 扩展项
+    调整有效长度，与 imm 比较后设置不同提示文案。优化管线第 8 步。
+
+    @param ps_lst: 伪指令列表（原地写 comment）
     """
     for inst in ps_lst:
         if (inst.inst_type == PI.ADD_T and
@@ -802,8 +913,12 @@ def add_comments(ps_lst):
 
 def count_left_push(ps_lst):
     """
-    @brief Count left 'push' instruction for an easy lookup
-    @param ps_lst List of PseudoInstructions
+    从序列末尾向前遍历，统计每个 PUSH 之后（到下一个 mov_ebp 重置前）“右侧还剩多少 push”，
+    把计数写入该指令的 comment 字段便于人工对照栈形。
+
+    优化管线第 9 步（与 count_left_pop 成对，用于分析而非删除指令）。
+
+    @param ps_lst: 伪指令列表（原地修改 comment）
     """
     count = 0
     for inst in reversed(ps_lst):
@@ -816,8 +931,12 @@ def count_left_push(ps_lst):
 
 def count_left_pop(ps_lst):
     """
-    @brief Count left 'pop' instruction for an easy lookup
-    @param ps_lst List of PseudoInstructions
+    从前向后扫描，统计每个 POP 之前（自上一个 mov_ebp 起）已出现的 POP 数量，
+    写入 comment 作为序号标记，便于与 push 侧计数对照。
+
+    优化管线第 9 步。
+
+    @param ps_lst: 伪指令列表（原地修改 comment）
     """
     count = 0
     for inst in ps_lst:
@@ -829,9 +948,12 @@ def count_left_pop(ps_lst):
 
 def delete_overwrote_st(ps_lst):
     """
-    @brief Delete assignements to scratch variables, which are not
-    relevant anymore
-    @param ps_lst List of PseudoInstructions
+    对同一 ST（SVARIABLE）左值的多次赋值，仅保留最后一次有效定义，将其余赋值标为 drop。
+
+    原理：先扫一遍建立每个 scratch 编号到“最后赋值位置”的映射，再第二遍把早于该位置
+    的同左值赋值标记删除。优化管线第 10 步。
+
+    @param ps_lst: 伪指令列表（原地修改 drop）
     """
     op_pos_dict = {}
     # search for last Assignement to st variable

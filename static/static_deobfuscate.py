@@ -279,12 +279,15 @@ def first_deobfuscate(ea, base, endaddr):
 
 def deobfuscate_all(base):
     """
-    @brief Converts every possible virtual code to VmInstructions
-    @param base Address of the jumptable of the virtual machine.
-    @return List of all possible VmInstructions
-    @remark This function is not used for deobfuscate the virtual code,
-    its just a test if every possible virtual instruction is translated
-    properly.
+    测试函数：遍历 0x00–0xFF 全部字节码，验证每条字节码能否经跳转表映射并翻译为 VmInstruction。
+
+    对每个字节码调用 get_instruction_list() 反汇编 handler，再构造 VmInstruction 并执行 get_pseudo_code()；
+    不参与 first_deobfuscate 的真实字节码区间反混淆，仅用于检查翻译器是否覆盖全部操作码。
+
+    在反混淆执行流中的位置：deobfuscate() 中与主路径并行调用，结果经 display_vm_inst() 写入 IDA 便于目检。
+
+    @param base 虚拟机跳转表基址
+    @return 256 个 VmInstruction 的列表（每个可能字节码一条）
     """
     catch_byte = 0x00
     vm_inst_lst = []
@@ -300,8 +303,14 @@ def deobfuscate_all(base):
 
 def display_ps_inst(ps_inst_lst):
     """
-    @brief Displays PseudoInstructions in the comments of Ida
-    @param ps_inst_lst List of PseudoInstructions
+    将伪指令序列写入 IDA 行注释，同一 VM 指令地址上的多条伪指令合并为一条多行注释。
+
+    按列表顺序累积文本；当下一条指令地址与当前相同时继续拼接，否则对该地址调用 MakeComm 提交并清空缓冲区，
+    避免同址覆盖并保留每条伪指令自带的 comment 字段。
+
+    在反混淆执行流中的位置：deobfuscate() 在 display==1 或 display>=2 时输出 push/pop 或优化后的伪指令。
+
+    @param ps_inst_lst 伪指令(PseudoInstruction)列表
     """
     length = len(ps_inst_lst)
     comm = ''
@@ -322,8 +331,13 @@ def display_ps_inst(ps_inst_lst):
 
 def display_vm_inst(vm_inst_lst):
     """
-    @brief Displays VirtualInstructions in the comments of Ida
-    @param vm_inst_lst List of VirtualInstructions
+    将虚拟指令(VmInstruction)列表写入 IDA 行注释，同址多条指令合并为一条注释。
+
+    算法与 display_ps_inst 相同：按地址分段累积字符串，地址变化时 MakeComm。
+
+    在反混淆执行流中的位置：deobfuscate() 在 display==0 时展示原始 VmInstruction，或展示 deobfuscate_all() 的测试结果。
+
+    @param vm_inst_lst VmInstruction 列表
     """
     length = len(vm_inst_lst)
     comm = ''
@@ -344,10 +358,15 @@ def display_vm_inst(vm_inst_lst):
 
 def read_in_comments(start, end):
     """
-    @brief Read in all ida comments between start and end
-    @param start Address where to start reading
-    @param end Address where to end reading
-    @return List of Tuples (comment, address of comment)
+    扫描地址区间内 IDA 的普通注释与反汇编注释，供后续保留逆向工程师的手写标注。
+
+    逐地址调用 CommentEx(addr, 0/1)；仅反汇编注释、仅普通注释或两者皆有分别处理，二者都存在时拼接为多行文本。
+
+    在反混淆执行流中的位置：deobfuscate() 起始阶段，读入结果供 get_jaddr_from_comments() 解析 “jumps to:” 等跳转提示。
+
+    @param start 起始地址
+    @param end 结束地址
+    @return (注释文本, 注释所在地址) 元组列表
     """
     ret = []
     addr = start
@@ -372,12 +391,16 @@ def read_in_comments(start, end):
 
 def find_start(start, end):
     """
-    @brief tries to find startaddress of function due to
-    crossrefernces
-    
-    @param start Startaddress of searching
-    @param end Endaddress
-    @return Startaddress of obfuscated function
+    在区间内通过交叉引用启发式推断混淆代码区域的单一“入口”地址。
+
+    对每个字节地址调用 DfirstB：若存在向后引用则计数并记录该地址；期望恰好只有一个地址被引用，
+    否则认为无法唯一确定并返回 BADADDR。
+
+    在反混淆执行流中的位置：deobfuscate() 在 real_start 未指定时确定 start_addr，用于插入入口 vpush 等。
+
+    @param start 搜索起始地址
+    @param end 搜索结束地址
+    @return 推断的函数/区域入口地址；无法解析时为 BADADDR
     """
     addr = start
     erg = 0
@@ -868,24 +891,33 @@ def jmp_to_orig(address, base):
 
 def static_vmctx(manual=False):
     """
-    Compute the VM context values statically.
-    :param manual: Bool -> Print result to the console
+    在未手动配置时，从 IDA 数据库中静态推断 VM 所需的四类地址并填入 VMContext（及 VMRepresentation 单例）。
+
+    启发式流程：按段名定位 VM 保护段；在段内取体积最大的函数作为 VM 入口；自入口向下寻找形如 jmp off_xxx[...] 的间接跳转，
+    从操作数字符串解析出跳转表基址；从段尾向前找到反汇编中含 “jmp” 的最后位置界定字节码区上界等。具体布局依赖 .vmp 类命名约定，易被定制混淆绕过。
+
+    在反混淆执行流中的位置：static_deobfuscate() 在 vmr.code_start 仍为 BADADDR 时自动调用，为 deobfuscate() 提供 code_start/code_end/base_addr/vm_addr。
+
+    @param manual 为 True 时在控制台打印推断出的四个地址，便于核对
+    @return 无返回值；推断得到的 VMContext 已赋给 get_vmr().vm_ctx
     """
     vm_ctx = VMContext()
     vm_seg_start = None
     vm_seg_end = None
     prev = 0
-    # try to find the vm Segment via name -> easiest case but also easy to foil
+    # 通过段名 .vmp* 定位 VM 所在段：实现简单但若壳改名或拆分段则失效
     for addr in Segments():
         if SegName(addr).startswith('.vmp'):
             vm_seg_start = SegStart(addr)
             vm_seg_end = SegEnd(addr)
             break
+    # 在 VM 段内枚举函数，取跨度最大者视为 VM 解释器/分发函数入口（体积累积最大）
     for f in Functions(vm_seg_start, vm_seg_end):
         if (GetFunctionAttr(f, FUNCATTR_END) - GetFunctionAttr(f, FUNCATTR_START)) > prev:
             prev = GetFunctionAttr(f, FUNCATTR_END) - GetFunctionAttr(f, FUNCATTR_START)
             vm_addr = f
 
+    # 从 VM 函数首条指令之后开始扫：典型布局中紧随其后的 jmp 通过 off_ 表实现多目标分发，解析该表地址即跳转表基址
     base_addr = NextHead(vm_addr)
     while base_addr < vm_seg_end:
         if GetMnem(base_addr).startswith('jmp'):
@@ -897,9 +929,11 @@ def static_vmctx(manual=False):
                 print e.args
         else:
             base_addr = NextHead(base_addr)
+    # 未在段内找到符合模式的 jmp，退化为让用户输入跳转表起始地址
     if base_addr > vm_seg_end:
         base_addr = AskAddr(base_addr, 'Could not determine the Startaddr of the jmp table, please specify: ')
 
+    # 字节码区：通常紧贴段尾之前，自段尾前一地址向前找到含 “jmp” 的反汇编行，再前进一字节作为字节码起点（与具体壳布局强相关）
     code_start = PrevAddr(vm_seg_end)
     while not GetDisasm(code_start).__contains__('jmp'):
         code_start = PrevAddr(code_start)
@@ -911,6 +945,7 @@ def static_vmctx(manual=False):
     vm_ctx.base_addr = base_addr
     vm_ctx.vm_addr = vm_addr
 
+    # 同步到全局 VM 表示层，供 static_deobfuscate / 菜单入口读取四个地址
     vmr = get_vmr()
     vmr.vm_ctx = vm_ctx
 
