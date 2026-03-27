@@ -1,5 +1,20 @@
 # -*- coding: utf-8 -*-
 """
+静态反混淆模块 - 将虚拟机字节码静态还原为可读的伪指令
+
+核心处理流程：
+1. 逐字节读取VM字节码
+2. 通过跳转表(jump table)将每个字节码映射到对应的x86 handler代码
+3. 分析handler的x86指令序列，识别为虚拟指令(VmInstruction)
+4. 转换为伪指令(PseudoInstruction)的push/pop表示
+5. 应用多轮优化（变量替换、赋值消减、NOR→NOT转换等）
+6. 划分基本块，构建抽象VM控制流图
+
+关键概念：
+- 跳转表：VM用字节码值 × 指针大小 + 基址，索引handler地址
+- Catch指令：handler中通过ESI/RSI从字节码流读取附加参数的指令
+- VM上下文(VMContext)：code_start、code_end、base_addr、vm_addr 4个关键地址
+
 @author: Tobias Krauss, Anatoli Kalysch
 """
 from idaapi import *
@@ -13,13 +28,13 @@ from lib.VmInstruction import VmInstruction
 from lib.VmInstruction import (add_ret_pop,
                                to_vpush)
 
-# import PseudoInstruction as PI
 import distorm3
 import lib.PseudoInstruction as PI
 import lib.StartVal as SV
 from ui.BBGraphViewer import show_graph
 from lib.VMRepresentation import VMContext, get_vmr
 
+# 基本块着色方案（6种颜色循环使用）
 bb_colors = [0xddddff, 0xffdddd, 0xddffdd, 0xffddff, 0xffffdd, 0xddffff]
 
 
@@ -119,11 +134,20 @@ def get_catch_reg(reg, length):
 
 def first_deobfuscate(ea, base, endaddr):
     """
-    @brief Converts virtual code between ea and endaddr to VmInstructions
-    @param ea Startaddress of virtual code
-    @param base Address of the jumptable of the virtual machine.
-    @param endaddr Endaddress of virtual code
-    @return List of all VmInstructions between ea and endaddr
+    主反混淆函数 - 将ea到endaddr之间的虚拟字节码转换为VmInstruction列表
+
+    工作流程（对每个字节码）：
+    1. 读取当前地址的字节值作为字节码
+    2. 通过calc_code_addr()查跳转表获取handler地址
+    3. 调用get_instruction_list()反汇编handler的x86指令序列
+    4. 检测是否有catch指令（从字节码流读取1/2/4/8字节参数）
+    5. 构造VmInstruction对象（自动识别为vpush/vpop/vadd等虚拟指令）
+    6. 遇到vjmp/vret时处理控制流（可能需要用户交互确认跳转目标）
+
+    @param ea 虚拟字节码起始地址
+    @param base 跳转表基址
+    @param endaddr 虚拟字节码结束地址
+    @return VmInstruction列表
     """
     curraddr = ea
     instr_lst = []
@@ -421,17 +445,27 @@ def get_jmp_loc(jmp_addr, jmp_addrs):
 
 def deobfuscate(code_saddr,  base_addr, code_eaddr, vm_addr, display=4, real_start=0):
     """
-    @brief This function does the deobfuscation between code_saddr and code_eaddr
-    @param code_saddr Address of the start of obfuscated code
-    @param base_addr Address of the jumptable of the virtual machine
-    @param code_eaddr Address of the end of obfuscated code
-    @param vm_addr Address of the virtual machine function
-    @param display Set output type
-        * 0 : VirtualInstruction
-        * 1 : PseudoInstruction Push/Pop representation
-        * 2 : PseudoInstruction full optimized
-    @param real_start Address of entry point of the function
-    @return The lowest found jump address
+    核心反混淆编排函数 - 完成从字节码到优化伪指令+CFG的全部流程
+
+    流程：
+    1. 确定反汇编类型(32/64位)
+    2. 读取已有IDA注释(用于保留逆向工程师手动标注的跳转地址)
+    3. 提取VM函数入口的push序列(函数参数)
+    4. first_deobfuscate(): 字节码→VmInstruction
+    5. add_ret_pop(): 处理vret的pop序列
+    6. make_pop_push_rep(): VmInstruction→push/pop伪指令表示
+    7. get_jmp_addresses(): 递归搜索跳转目标地址
+    8. find_basic_blocks(): 划分基本块
+    9. optimize(): 对每个基本块执行优化管线
+    10. 在IDA中显示注释/抽象VM控制流图
+
+    @param code_saddr 混淆代码起始地址
+    @param base_addr 跳转表基址
+    @param code_eaddr 混淆代码结束地址
+    @param vm_addr VM函数起始地址
+    @param display 输出模式: 0=VmInstruction, 1=push/pop表示, 2+=完全优化+CFG
+    @param real_start 函数真实入口地址
+    @return 找到的最小跳转地址
     """
     set_dissassembly_type()
     comment_list = read_in_comments(code_saddr, code_eaddr)

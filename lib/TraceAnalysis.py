@@ -1,6 +1,14 @@
-# # coding=utf-8
-# __author__ = 'Anatoli Kalysch'
-#
+# coding=utf-8
+"""
+Trace分析模块 - 包含所有动态分析的核心算法
+
+主要功能：
+1. 聚类分析(repetition_clustering) - 将trace按重复模式分组
+2. VM上下文发现(dynamic_vm_values) - 从trace中动态确定VM的关键地址
+3. 虚拟寄存器映射(find_virtual_regs) - 建立栈地址到真实寄存器的映射
+4. 输入/输出分析(find_input/find_output) - 黑盒追踪VM函数的I/O值
+5. 虚拟寄存器回溯(follow_virt_reg) - 从输出值反向追踪计算过程
+"""
 import operator
 from _collections import defaultdict
 from copy import deepcopy
@@ -256,11 +264,17 @@ def create_cluster_gist(cluster, ctx_reg_size, prev_line_ctx, stack_changes):
 
 def repetition_clustering(trace, **kwargs):
     """
-    Cluster the trace into groups of repeating instructions(=clusters) and non-repeating instructions(=singles)
+    重复聚类算法 - 将trace分为重复指令组(clusters)和单独指令(singles)
 
-    :param trace: instruction trace
-    :param kwargs: rounds=clustering_rounds
-    :return: list where an element is either another list(=cluster of addrs) or an int (=single addr)
+    算法原理：
+    1. 将trace视为元素序列，两两相邻配对
+    2. 检查每对是否在trace中重复出现(超过cluster_magic次)
+    3. 如果是，将它们合并为一个cluster（列表）
+    4. 贪心模式下反复执行，直到无法再合并
+
+    :param trace: 指令trace
+    :param kwargs: rounds=指定聚类轮次（默认为贪心模式，即一直聚类到无变化）
+    :return: 混合列表，元素为Traceline（单独指令）或list[Traceline]（重复聚类）
     """
     rounds = kwargs.get('rounds', None)
     if trace is None:
@@ -372,13 +386,21 @@ def extract_vm_segment(trace):
 
 def dynamic_vm_values(trace, code_start=BADADDR, code_end=BADADDR, silent=False):
     """
-    Find the virtual machine context necessary for an automated static analysis.
-    code_start = the bytecode start -> often the param for vm_func and usually starts right after vm_func
-    code_end = the bytecode end -> bytecode usually a big chunk, so if we identify several  x86/x64 inst in a row we reached the end
-    base_addr = startaddr of the jmp table -> most often used offset in the vm_trace
-    vm_addr = startaddr of the vm function -> biggest function in .vmp segment,
-    :param trace: instruction trace
-    :return: vm_ctx -> [code_start, code_end, base_addr, vm_func_addr, vm_funcs]
+    从指令trace动态确定VM上下文(VMContext)的4个关键值：
+
+    - code_start: 字节码起始地址（通常是vm_func的参数，位于vm_func之后）
+    - code_end: 字节码结束地址（通常延伸到.vmp段末尾）
+    - base_addr: 跳转表基址（trace中使用频率最高的offset，VM通过它索引handler）
+    - vm_addr: VM函数起始地址（.vmp段中最大的函数）
+
+    发现策略：
+    1. vm_addr: 通过push指令频率分析找到VM主循环函数
+    2. base_addr: 统计trace中 off_XXXX[...] 形式的引用，取频率最高者
+    3. code_start: vm_func结束后第一个非代码区域的起始
+    4. code_end: .vmp段的结束地址
+
+    :param trace: 指令trace
+    :return: VMContext对象
     """
     base_addr = defaultdict(lambda: 0)
     vm_addr = find_vm_addr(deepcopy(trace))
@@ -613,11 +635,21 @@ def find_output(trace, manual=False, update=None):
 
 def follow_virt_reg(trace, **kwargs):
     """
-    Follows the virtual registers and extracts the relevant trace lines to clarify how the final result in a virtual register came to be and what values(=recursively) it consists of.
-    :param trace: instruction trace
-    :param virt_reg_addr: the stack addr of the virtual register
-    :param real_reg_name: reg string
-    :return: trace consisting of relevant tracelines for the virtual register
+    虚拟寄存器回溯算法 - 从VM出口的寄存器值反向追踪其计算过程
+
+    核心算法：
+    1. 执行常量传播+栈地址传播预处理
+    2. 反转trace，从末尾的pop指令获取目标寄存器的初始值
+    3. 维护两个监视集合：reg_vals(关注的值) 和 watch_addrs(关注的栈地址)
+    4. 反向遍历trace，当某个关注的值首次出现在ctx中时：
+       - 如果是mov from mem → 将源内存地址加入watch_addrs
+       - 如果是计算指令 → 将操作数的寄存器值递归加入reg_vals
+    5. 同时监视栈地址，当关注地址被写入时记录该行
+
+    :param trace: 指令trace
+    :param virt_reg_addr: 虚拟寄存器的栈地址
+    :param real_reg_name: 真实寄存器名
+    :return: 仅包含与该寄存器值计算相关的trace行
     """
     assert(isinstance(trace, Trace))
     update = kwargs.get('update', None)

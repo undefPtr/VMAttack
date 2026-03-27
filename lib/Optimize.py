@@ -1,6 +1,19 @@
 #!/usr/bin/env python
-
 """
+伪指令优化模块 - 对静态反混淆产生的push/pop伪指令序列进行多轮优化
+
+优化管线（optimize函数中的执行顺序）：
+1. replace_scratch_variables: 将栈暂存区操作数(ST_xx)替换为临时变量(T_xx)
+2. replace_push_ebp: 将push ebp与其关联的栈值整合为数组操作数
+3. replace_pop_push: 匹配push-pop对，转换为直接赋值(T_x = T_y)
+4. reduce_assignements: 传递赋值消减(T2=T1, T3=T2 → T3=T1)
+5. convert_read_array: 将vread数组操作数简化为直接赋值
+6. change_nor_to_not: 当vnor的两个操作数相同时转换为vnot
+7. reduce_ret: 删除vret附近的冗余赋值
+8. add_comments: 为疑似函数参数访问的指令添加AOS注释
+9. count_left_push/pop: 计数剩余push/pop便于分析
+10. delete_overwrote_st: 删除被后续覆盖的栈暂存区赋值
+
 @author: Tobias
 """
 

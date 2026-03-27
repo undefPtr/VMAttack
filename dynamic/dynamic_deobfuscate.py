@@ -1,4 +1,17 @@
 # coding=utf-8
+"""
+动态分析调度模块 - 封装所有动态分析功能的入口函数
+
+主要功能：
+1. Trace管理：生成(gen_instruction_trace)、加载(load_trace)、保存(save_trace)
+2. 评分系统(grading_automaton)：综合多种分析结果自动评分
+3. 聚类分析(clustering_analysis)：将trace按重复模式分组
+4. 输入/输出分析(input_output_analysis)：黑盒追踪VM函数I/O
+5. 优化分析(optimization_analysis)：交互式trace优化
+6. DynamicAnalyzer：多线程分析封装类
+
+所有分析函数在操作trace前都先deepcopy，保护全局原始数据。
+"""
 
 __author__ = 'Anatoli Kalysch'
 
@@ -272,9 +285,17 @@ def dynamic_vmctx(manual=False):
 
 def init_grading(trace):
     """
-    Grading System initialization. This function is part of the automaton grading system.
-    High grade equals importance. The higher the better. This is the initialization routine for the grading automaton. It assigns the initial grade according to the uniqueness of a line.
-    :param trace: instruction trace
+    评分系统初始化 - 根据地址唯一性赋予初始评分
+
+    原理：出现频率越低的地址(即越"独特"的指令)初始评分越高。
+    这是因为VM handler中的循环指令会大量重复，而真正的计算指令往往只出现少数几次。
+
+    算法：
+    1. 统计每个地址的出现次数
+    2. 按出现次数排序，分配不同等级
+    3. 出现次数最少的得最高分
+    :param trace: 指令trace
+    :return: 带初始评分的trace
     """
     bp()
     addr_count = address_count(deepcopy(trace))
@@ -294,11 +315,24 @@ def init_grading(trace):
 
 def grading_automaton(visualization=0):
     """
-    Grading System Analysis computes a grade for every trace line. It is basically a combination of all available analysis capabilities and runs them one after another, increases the grade
-    for those trace lines which are in the analysis result and then runs the next trace analysis. In between the analysis runs a pattern matching run is started, to increase / decrease cer-
-    tain trace lines grades based on known patterns. The patterns are modelled after known short comings of the analysis capabilities.
-    :param trace: instruction trace
-    :return: graded instruction trace
+    评分系统分析 - 综合所有分析能力为每行trace自动评分
+
+    评分越高表示该行越可能是被混淆函数的关键指令。
+    算法分8个阶段：
+
+    1. 初始化评分(init_grading)：按地址唯一性赋初始分（出现越少分越高）
+    2. 寄存器使用频率分类：将寄存器分为重要/不重要两组
+    3. 优化预处理：执行常量传播+栈地址传播
+    4. 输入/输出分析提升：包含I/O值的行加分，重要寄存器路径加分，不重要寄存器降分
+    5. 寄存器频率降分：最常用的寄存器相关行降分，mov/jmp/push/pop等降分
+    6. 聚类分析提升：聚类后的单独行(非重复)加分
+    7. 窥孔评分：pop/push/inc/dec/lea/test/jmp/mov降分，其他加分
+    8. 优化结果提升：优化后存活的行加分，使用内存且非mov的行额外加分
+
+    最后还考虑静态分析结果和递归调用。
+
+    :param visualization: 0=GradingViewer展示, 其他=控制台输出
+    :return: 评分后的trace
     """
     vmr = get_vmr()
 

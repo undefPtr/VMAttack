@@ -1,4 +1,13 @@
 # coding=utf-8
+"""
+Trace优化模块 - 对动态指令trace进行多种优化处理
+
+优化分为两类：
+1. 传播(Propagation)：用已知值替换寄存器/内存引用，不删除任何行，始终安全
+2. 折叠(Folding)：删除被认为无用的行，可能过度删除，需谨慎使用
+
+优化执行顺序：常量传播 → 栈地址传播 → 操作标准化 → 无用操作数折叠 → 窥孔优化
+"""
 from collections import defaultdict
 
 __author__ = 'Anatoli Kalysch'
@@ -10,15 +19,18 @@ from lib.log import get_logger
 #######################################
 ### OPTIMIZATION AND RELATED FUNC   ###
 #######################################
-"""Propagations should be always save to use, as they do not leave out anything. Foldings should be used with care, as
-they leave out lines deemed unuseful and as such might leave out too much."""
 
 def optimization_peephole_folding(trace):
     """
-    Peephole optimizations take identified patterns and use them on the trace. Can be powerful, but patterns have to be identified manually first.
-    TODO peephole will be improved with new patterns
-    :param trace:
-    :return:
+    窥孔优化（折叠型，可能删除行）
+    基于预定义的指令模式对trace进行精简：
+    1. 频率分析：删除出现频率最高的地址簇（通常是VM handler循环体）
+    2. mov+movzx合并：将连续的 mov reg,reg + movzx/movsx reg,reg 合并为一条
+    3. 删除高编号寄存器(>4)的inc/dec（通常是VM内部计数器操作）
+    4. 删除三连重复行（地址相同或助记符相同的连续三行）
+    5. 传播后优化：删除栈到寄存器的mov（值已传播到注释中）
+    :param trace: Trace对象
+    :return: 优化后的trace
     """
     kill_index = []
 
@@ -88,9 +100,19 @@ def optimization_peephole_folding(trace):
 
 def optimization_const_propagation(trace):
     """
-    Otimization replacing register names or computing and replacing memory locations in the trace with their known values.
-    :param trace: Trace object
-    :return: optimized trace
+    常量传播优化（传播型，安全，不删除行）
+    利用每行trace记录的CPU上下文(ctx)，将操作数中的寄存器名替换为具体值，
+    并计算内存地址表达式(如 [eax+edx] → [计算后的地址])。
+
+    处理的情况：
+    - inst op1, reg → 用前一行ctx中reg的值替换
+    - inst op1, [reg] → 用前一行ctx中reg的值替换为具体地址
+    - inst op1, [reg+/-off] → 计算数学表达式，替换为具体地址
+    - inst op1, byte/word ptr [reg] → 替换ptr内的寄存器为具体值
+    - inst op1, xs:[reg] → 替换段寄存器寻址中的寄存器
+    - cmp reg, op2 → 额外替换op1中的寄存器（便于分析比较值）
+    :param trace: Trace对象
+    :return: 优化后的trace
     """
     logger = get_logger("optimization_const_propagation", console_log = False, file_log = True)
 
@@ -254,10 +276,13 @@ def optimization_const_propagation(trace):
 
 def optimization_standard_ops_folding(trace):
     """
-    Optimization changes certain operations into other, more standardized operations. This enables readability and pattern recognition.
-    TODO standardization will be improved with new patterns
-    :param trace:
-    :return:
+    操作标准化优化（折叠型）
+    将某些操作替换为更标准/更易读的等价形式，便于后续模式识别：
+    - add x, 1 → inc x
+    - sub x, 1 → dec x
+    依赖：需要先执行常量传播和栈地址传播
+    :param trace: Trace对象
+    :return: 优化后的trace
     """
     if not trace.constant_propagation:
         trace = optimization_const_propagation(trace)
@@ -300,9 +325,14 @@ def optimization_standard_ops_folding(trace):
 
 def optimization_unused_operand_folding(trace):
     """
-    Remove unused operands. TODO
-    :param trace:
-    :return:
+    无用操作数折叠（折叠型，可能删除行）
+    检测并删除以下模式：
+    1. 所有跳转指令（VM内部跳转对分析无用）
+    2. mov reg, x 后该寄存器未被使用就被覆盖 → 删除原mov
+    3. mov [mem], x 后该内存地址未被读取就被覆盖 → 删除原mov
+    依赖：需要先执行常量传播和栈地址传播
+    :param trace: Trace对象
+    :return: 优化后的trace
     """
     if not trace.constant_propagation:
         trace = optimization_const_propagation(trace)
@@ -362,9 +392,17 @@ def optimization_unused_operand_folding(trace):
 
 def optimization_stack_addr_propagation(trace):
     """
-    Add a comment to each line dereferencing an address. Executes constant propagation prior to execution if not already done.
-    :param trace: unclustered trace
-    :return: optimized trace
+    栈地址传播（传播型，安全，不删除行）
+    维护一个伪栈(pseudo_stack)字典，追踪所有栈操作：
+    - mov [mem], val → 记录 pseudo_stack[mem] = val
+    - push reg → 记录 pseudo_stack[rsp_value] = reg_value
+    - pop → 从pseudo_stack中移除对应栈地址
+    - 读取栈地址时(如 inst reg, [mem]) → 在line.comment中添加 [mem]=value 注释
+
+    这使得逆向工程师可以追踪栈上值的流动，对于基于栈的虚拟机分析尤为重要。
+    依赖：如果常量传播未执行，会先自动执行。
+    :param trace: 未聚类的trace
+    :return: 优化后的trace（带栈注释）
     """
     # first we build a pseudo stack
     pseudo_stack = {}
@@ -451,10 +489,11 @@ def optimization_stack_addr_propagation(trace):
 
 def optimization_selective_register_folding(trace, reg_strings):
     """
-
-    :param trace:
-    :param reg_strings:
-    :return:
+    选择性寄存器折叠 - 从trace中删除涉及指定寄存器的所有行
+    用于UI中勾选寄存器复选框时过滤掉不关心的寄存器操作
+    :param trace: Trace对象
+    :param reg_strings: 要过滤的寄存器名列表，如 ['eax', 'ebx']
+    :return: 过滤后的trace
     """
     ignored_regs = [get_reg_class(reg) for reg in reg_strings]
     kill_index = []
@@ -474,17 +513,17 @@ def optimization_selective_register_folding(trace, reg_strings):
     return trace
 
 
-# list of all optimizations
+# 所有可用的优化函数列表（按执行顺序排列）
 optimizations = [optimization_const_propagation, optimization_stack_addr_propagation, optimization_standard_ops_folding, optimization_unused_operand_folding, optimization_peephole_folding]
-# optimization names for human readability
+# 优化名称（用于UI显示）
 optimization_names = ['Constant Propagation', 'Stack Address Propagation', 'Operation Standardisation (Folding)', 'Unused Operand Folding', 'Peephole (Folding)']
 
 
 def optimize(trace):
     """
-    run all available optimizations on the trace and present it
-    :param trace:
-    :return:
+    按顺序执行所有可用优化：常量传播→栈地址传播→操作标准化→无用操作数折叠→窥孔优化
+    :param trace: 原始Trace对象
+    :return: 完全优化后的trace
     """
     global optimizations
     for optimization in optimizations:

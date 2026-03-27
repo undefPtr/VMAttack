@@ -1,63 +1,75 @@
 #!/usr/bin/env python
-
 """
+伪指令(PseudoInstruction)定义模块
+
+伪指令是VMAttack对VM字节码还原后的中间表示(IR)。
+每条VM字节码最终被翻译为一组push/pop形式的伪指令。
+
+操作数类型体系：
+- PseudoOperand: 类x86操作数（寄存器/立即数/内存/引用）
+- ScratchOperand(ST_xx): VM栈暂存区操作数（由edi间接寻址）
+- VariableOperand(T_xx): 临时变量（优化中间产物）
+- ArrayOperand(A_xx): 数组/指针操作数（表示栈上多个连续值）
+- DoubleVariable: 双结果操作数（用于imul/idiv产生两个结果的情况）
+
+指令类(inst_class)描述输入/输出操作数数量：
+- IN2_OUT2: 2输入2输出（vadd, vnor, vshr, vshl）
+- IN2_OUT3: 2输入3输出（vimul）
+- IN3_OUT3: 3输入3输出（vidiv）
+- IN1_OUT1: 1输入1输出（vread）
+- IN2_OUT0: 2输入0输出（vwrite）
+- IN1_OUT0: 1输入0输出（vjmp）
+
+make_pop_push_rep()方法将高层VM指令展开为push/pop序列+赋值语句，
+引入临时变量使数据流更清晰。
+
 @author: Tobias
 """
 
 from lib.Register import (get_reg_class,
                           get_reg_class_lst)
-# get_size_by_reg)
 from lib import StartVal as SV
 
 
+# ========== 操作数类型 ==========
+REGISTER_T = 'regiser'     # 寄存器操作数
+MEMORY_T = 'memory'        # 内存操作数
+IMMEDIATE_T = 'immediate'  # 立即数操作数
+REFERENCE_T = 'reference'  # 引用操作数（地址解引用）
 
-# Operand types
-REGISTER_T = 'regiser'
-MEMORY_T = 'memory'
-IMMEDIATE_T = 'immediate'
-REFERENCE_T = 'reference'
+SVARIABLE_T = 'svariable'  # 栈暂存区变量(Scratch Variable, ST_xx)
+VARIABLE_T = 'variable'    # 临时变量(Temporal Variable, T_xx)
+DOUBLEV_T = 'doublev'      # 双结果变量（imul/idiv的两个结果）
+POINTER_T = 'pointer'      # 指针操作数
+ARRAY_T = 'array'          # 数组操作数（栈上多个值的集合）
+EXP_T = 'exp_t'            # 预期操作数（如返回地址、函数参数占位符）
 
-# new Operand types
-SVARIABLE_T = 'svariable'
-VARIABLE_T = 'variable'
-DOUBLEV_T = 'doublev'
-POINTER_T = 'pointer'
-ARRAY_T = 'array'
-# an operand that is expect to be there
-EXP_T = 'exp_t'
+# ========== 指令类型 ==========
+NOTHING_T = 'nothing_T'    # 空/赋值（优化后的直接赋值语句）
+PUSH_T = 'push_T'          # vpush
+POP_T = 'pop_T'            # vpop
+JMP_T = 'jmp_T'            # vjmp
+ADD_T = 'add_T'            # vadd
+NOR_T = 'nort_T'           # vnor
+READ_T = 'read_T'          # vread（内存读）
+WRITE_T = 'write_T'        # vwrite（内存写）
+RET_T = 'ret_T'            # vret
+MOV_EBP_T = 'mov_ebp_T'   # vebp_mov（栈帧切换）
+IMUL_T = 'imul_T'          # vimul
+DIV_T = 'div_T'            # vidiv
+NOT_T = 'not_T'            # vnot（由vnor优化得到）
+UNDEF_T = 'undef_T'        # 未识别的指令
 
+# ========== 指令类（I/O模式）==========
+IN1_OUT1 = 'in1_out1'      # 1输入1输出（vread）
+IN1_OUT0 = 'in1_out0'      # 1输入0输出（vjmp）
+IN2_OUT0 = 'in2_out0'      # 2输入0输出（vwrite）
+IN2_OUT2 = 'in2_out2'      # 2输入2输出（vadd/vnor/vshr/vshl）
+IN2_OUT3 = 'in2_out3'      # 2输入3输出（vimul）
+IN3_OUT2 = 'in3_out2'      # 3输入2输出（vshrd/vshld）
+IN3_OUT3 = 'in3_out3'      # 3输入3输出（vidiv）
 
-# Instruction types
-NOTHING_T = 'nothing_T'
-PUSH_T = 'push_T'
-POP_T = 'pop_T'
-JMP_T = 'jmp_T'
-ADD_T = 'add_T'
-NOR_T = 'nort_T'
-READ_T = 'read_T'
-WRITE_T = 'write_T'
-RET_T = 'ret_T'
-MOV_EBP_T = 'mov_ebp_T'
-IMUL_T = 'imul_T'
-DIV_T = 'div_T'
-
-# new Instruction types
-NOT_T = 'not_T'
-UNDEF_T = 'undef_T'
-
-
-# Instruction classes out of reversing
-IN1_OUT1 = 'in1_out1'
-IN1_OUT0 = 'in1_out0'
-IN2_OUT0 = 'in2_out0'
-IN2_OUT2 = 'in2_out2'
-IN2_OUT3 = 'in2_out3'
-IN3_OUT2 = 'in3_out2'
-IN3_OUT3 = 'in3_out3'
-
-
-# Further instruction classes
-ASSIGNEMENT_T = 'assign_T'
+ASSIGNEMENT_T = 'assign_T' # 赋值类（优化后的指令形式：result = op inst op）
 
 
 class Operand(object):

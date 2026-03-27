@@ -1,10 +1,29 @@
 # coding=utf-8
+"""
+Trace数据结构定义模块
+
+Trace：指令trace的容器，继承自list，额外维护5个优化状态标志位，
+       各优化函数执行后会设置对应标志，后续优化可据此判断前置条件是否满足。
+
+Traceline：trace中的单行记录，包含：
+  - thread_id: 线程ID
+  - addr: 指令地址
+  - disasm: 反汇编列表 [opcode, op1, op2]
+  - ctx: 执行后的CPU上下文字典 {reg_name: value_str}
+  - comment: 分析注释（栈地址传播等优化会填充此字段）
+  - grade: 评分（grading_automaton使用，越高越重要）
+"""
 from lib.Register import get_reg_class
 
 __author__ = 'Anatoli Kalysch'
 
 
 class Trace(list):
+    """
+    指令trace容器，继承自list。
+    带有5个优化状态标志位，用于避免重复执行已完成的优化。
+    ctx_reg_size标识寄存器宽度(32/64)，影响寄存器名的选取。
+    """
     def __init__(self, reg_size=64, tr=None):
         super(Trace, self).__init__()
         self.peephole = False
@@ -21,6 +40,11 @@ class Trace(list):
 
 
 class Traceline(object):
+    """
+    trace中的单行记录。
+    _line = [thread_id, addr, disasm, ctx, comment]
+    grade: 评分值，grading_automaton中通过raise_grade/lower_grade调整
+    """
     def __init__(self, **kwargs):
         self._line = [kwargs.get('thread_id'),
                       kwargs.get('addr'),

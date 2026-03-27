@@ -1,5 +1,28 @@
 # -*- coding: utf-8 -*-
 """
+虚拟机指令识别模块
+
+VmInstruction类接收一组x86 handler指令，通过模式匹配识别出对应的虚拟指令类型。
+支持的虚拟指令（15种）：
+  vpush  - 压栈：sub ebp + mov [ebp], value
+  vpop   - 出栈：mov value, [ebp] + add ebp
+  vadd   - 加法：两个操作数的add指令
+  vnor   - NOR运算：not + not + and 组合
+  vjmp   - 跳转：读取新的指令指针(ESI)
+  vret   - 返回：ret指令
+  vread  - 内存读：从内存地址读取值
+  vwrite - 内存写：向内存地址写入值
+  vshr   - 右移：shr指令
+  vshl   - 左移：shl指令
+  vshrd  - 双精度右移：shrd指令
+  vshld  - 双精度左移：shld指令
+  vcall  - 函数调用：call指令
+  vimul  - 有符号乘法：imul指令
+  vidiv  - 有符号除法：idiv指令
+  vebp_mov - ebp赋值：mov ebp, ebp形式
+
+识别策略：在handler的x86指令中寻找"特征动作"，如sub ebp表示vpush，add ebp表示vpop
+
 @author: Tobias Krauss
 """
 
@@ -170,17 +193,22 @@ def extend_signed_catch_val(reg, catch_value):
 
 class VmInstruction(object):
     """
-    @brief Converts the exectued x86 code to the corresponding PseudoInstruction
+    虚拟机指令类 - 将一组x86 handler指令识别为对应的虚拟指令
+
+    handler指令被分为两类：
+    - Vinstructions: 涉及ESI/RSI的指令（VM内部基础设施，如字节码指针操作）
+    - Instructions: 不涉及ESI/RSI的指令（实际执行逻辑）
+
+    识别过程通过get_pseudo_code()触发，按优先级尝试匹配各种虚拟指令模式。
     """
 
 
     def __init__(self, instr_lst, catch_value, catch_reg, inst_addr):
         """
-        @param instr_lst List of x86 instructions
-        @param catch_value Value that is catched from the virtual code
-        or None if there is no value catched
-        @param catch_reg Register in which the catch_value is moved
-        @param inst_addr Address of the VmInstruction
+        @param instr_lst handler中的x86指令列表
+        @param catch_value 从字节码流中读取的附加参数值（catch指令获取的值）
+        @param catch_reg 存放catch_value的寄存器名
+        @param inst_addr 该虚拟指令在字节码中的地址
         """
         self.all_instructions = instr_lst
         self.Vinstructions = []

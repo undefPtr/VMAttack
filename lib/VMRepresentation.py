@@ -1,10 +1,27 @@
 # coding=utf-8
+"""
+VM全局状态模块 - 使用单例模式维护整个分析会话的全局状态
+
+VMRepresentation (单例):
+  - trace: 当前指令trace
+  - vm_ctx: VM上下文(VMContext)，包含4个关键地址
+  - vm_operands/vm_returns: VM函数的输入/输出参数
+  - vm_stack_reg_mapping: 栈地址到真实寄存器的映射
+  - 评分权重: in_out, pa_ma, clu, mem_use, static
+  - 环境配置: sys_libs, extract_param, greedy, bb, cluster_magic
+
+VMContext:
+  - code_start: 字节码起始地址
+  - code_end: 字节码结束地址
+  - base_addr: 跳转表基址
+  - vm_addr: VM函数起始地址
+"""
 
 from idaapi import BADADDR
 from bp import *
 
 class VMRepresentation(object):
-    # private scriptor class contains the necessary info for analysis
+    # 私有内部类，真正存储所有分析状态
     class __Scriptor:
         def __init__(self):
             # dbg handler and trace
