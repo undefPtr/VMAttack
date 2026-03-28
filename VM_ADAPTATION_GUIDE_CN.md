@@ -566,3 +566,249 @@ class CustomWalker(BytecodeWalker):
 | 反分析 | 段名混淆 | 控制流平坦化 | handler 加密 |
 
 > 注意：以上信息为通用参考，不同版本和配置可能差异很大。始终以实际逆向分析为准。
+
+## 7. 实战案例：TVM 架构分析与适配方案
+
+以下是对一个实际 VM 保护方案的逆向分析结果，展示如何将适配指南中的方法论应用于真实场景。
+
+### 7.1 目标函数
+
+- **函数地址**: `0x14003EF70`
+- **保护方案**: TVM（自定义虚拟机保护）
+- **架构**: x86-64
+- **分析方法**: IDA Pro CFG 导出 + SVG 图形分析
+
+### 7.2 VM 入口序列分析
+
+```
+0x14003EF70: jmp 0x1404463C2             ← VM入口（jmp 转发到 VM 初始化）
+
+=== VM 初始化 (0x1404463C2, 19条指令) ===
+
+0x1404463C2: lea rsp, [rsp - 0x290]     ← 分配 0x290 字节的 VM 上下文空间
+0x1404463CA: mov [rsp + 0x10], rbp      ← 保存原始 rbp
+0x1404463CF: mov rbp, rsp               ← ★ rbp = VM 上下文基址
+0x1404463D2: pushfq                     ← 保存 flags
+0x1404463D3: pop [rbp]                  ← flags → [rbp+0x00]
+0x1404463D6: mov [rbp + 0x78], r14      ← 保存 r14
+
+--- 混淆的寄存器保存（not+xchg 模式）---
+0x1404463DA: not r11                    ┐
+0x1404463DD: xchg rdx, r11             │ 等价于保存 rdx
+0x1404463E0: mov [rbp + 0x30], r11     │ [rbp+0x30] = 原始 rdx
+0x1404463E4: not rdx                   │ 恢复 rdx
+0x1404463E7: xchg rdx, r11            ┘
+
+0x1404463EA: not rax                   ┐
+0x1404463ED: xchg r9, rax              │ 等价于保存 rax
+0x1404463EF: mov [rbp + 0x50], rax     │ [rbp+0x50] = 原始 rax
+0x1404463F3: not r9                    ┘ r9 = 原始 rax
+
+--- 计算下一个 handler 地址（混淆的 lea）---
+0x1404463F6: push rdx
+0x1404463F7: lea rdx, [rip + 0x6716164B]
+0x1404463FE: lea rdx, [rdx - 0x67160F5C]  ← rdx = 相对偏移计算
+0x140446405: jmp rdx                       ← 跳转到下一个基本块
+```
+
+### 7.3 VM 上下文布局
+
+```
+RBP → VM Context (0x290 bytes)
+┌────────────────────────────────────────┐
+│ [rbp + 0x00]  = RFLAGS               │
+│ [rbp + 0x08]  = RCX                  │
+│ [rbp + 0x10]  = 原始 RBP（保存的调用者）│
+│ [rbp + 0x18]  = RBX                  │
+│ [rbp + 0x20]  = R10                  │
+│ [rbp + 0x28]  = RDI                  │
+│ [rbp + 0x30]  = RDX （via not+xchg） │
+│ [rbp + 0x38]  = RSI                  │
+│ [rbp + 0x40]  = RSP（原始栈指针）      │
+│ [rbp + 0x48]  = R9 / 临时            │
+│ [rbp + 0x50]  = RAX （via not+xchg） │
+│ [rbp + 0x58]  = R9 / 临时            │
+│ [rbp + 0x60]  = ★ VPC（字节码指针）  │  ← 关键！
+│ [rbp + 0x68]  = R12                  │
+│ [rbp + 0x70]  = R13                  │
+│ [rbp + 0x78]  = R14                  │
+│ [rbp + 0x80]  = R15                  │
+│ [rbp + 0x88+] = VM 操作栈空间         │
+└────────────────────────────────────────┘
+```
+
+### 7.4 Handler 分发机制
+
+此 VM **没有集中的 dispatch 循环**。每个 handler 自行完成：
+
+```
+1. 加载 VPC:     mov r9, [rbp + 0x60]
+2. 读取操作码:   mov r8w, word ptr [r9]        ← ★ 2字节操作码
+3. 解码操作码:   复杂的 MBA 运算（xor/and/or/not 配合内存常量）
+4. 推进 VPC:     add r9, 2 (或更多，取决于是否有 catch)
+                 通过混淆计算写回 [rbp+0x60]
+5. 计算目标:     lea + movsxd + 混淆运算 → handler 相对偏移
+                 lea r9, [rip + base_table]
+                 add r9, r8(offset)            ← 查跳转表
+6. 跳转:         jmp rdx/r8/r9/r11/rax/rcx     ← 目标寄存器不固定
+```
+
+特征码：每个 handler 末尾都能看到 `movsxd` + `lea [rip+...]` + `add` + 混淆运算 + `jmp reg` 的模式。
+
+### 7.5 MBA 混淆分析
+
+Handler 中大量使用 Mixed Boolean-Arithmetic (MBA) 混淆，典型模式：
+
+```
+=== 恒等变换（混淆的 mov）===
+原始语义: mov dst, src
+混淆实现:
+  mov dst, src
+  and dst, src       ← a & a = a（冗余）
+  and dst, 0xMASK
+  mov tmp, dst
+  and tmp, [rip+C1]
+  xor tmp, [rip+C2]
+  or dst, tmp        ← 恒等变换链
+  xor dst, src
+
+=== NOR 运算 ===
+原始语义: result = val
+混淆实现:
+  not a
+  xor a, [rip+C1]
+  xor a, [rip+C2]  ← C1 xor C2 = 0，两次 xor 抵消
+  not a             ← 两次 not 抵消
+  or a, b
+  not a
+
+=== 混淆的地址计算 ===
+lea r9, [rip + LARGE_CONST]
+movsxd r8, r8d
+add r9, r8
+not rcx; add r9, r8; not r9
+or rcx, r9; not rcx; or rdx, rcx
+jmp rdx               ← 经过混淆的间接跳转
+```
+
+### 7.6 与 VMAttack 假设的对比
+
+| 维度 | VMAttack 假设 | TVM 实际 | 差异程度 |
+|------|-------------|---------|:---:|
+| VPC 存储 | ESI/RSI 寄存器 | `[rbp+0x60]` 内存 | **极大** |
+| VPC 加载 | 直接使用 ESI | `mov r9, [rbp+0x60]` 间接 | **极大** |
+| 操作码宽度 | 1 字节 | 2 字节 (word) | **大** |
+| 跳转表 | `Dword(opcode*4+base)` 直接查表 | 经 MBA 混淆的相对偏移计算 | **极大** |
+| Handler 终止 | `jmp dispatch`（固定目标） | `jmp reg`（每次不同寄存器） | **大** |
+| Dispatch 模式 | 集中式循环 | 每个 handler 自带 dispatch | **极大** |
+| 寄存器保存 | 直接 push/mov | `not+xchg+mov` 混淆 | **中** |
+| 栈操作 | `sub ebp`=push, `add ebp`=pop | 待进一步分析 | **待定** |
+| RBP 角色 | VM 栈顶指针 | VM 上下文结构体基址 | **极大** |
+| 混淆层 | 无 | 大量 MBA 混淆 | **新增需求** |
+
+### 7.7 适配方案
+
+#### 方案 A：优先动态分析（推荐）
+
+动态分析路径的适配成本最低，因为 trace 采集不依赖 VM 结构假设：
+
+```
+1. 不需要修改的部分:
+   - IDADebugger.py（trace 采集是通用的）
+   - TraceRepresentation.py（数据结构通用）
+   - DebuggerHandler.py（trace I/O 通用）
+
+2. 需要小改的部分:
+   TraceOptimizations.py:
+     - 窥孔优化中 MBA 混淆指令会被保留（需要排除）
+     - 新增 MBA 化简优化步骤
+
+   TraceAnalysis.py:
+     - find_vm_addr(): 此 VM 可能无 .vmp 段名 → 手动设置
+     - follow_virt_reg(): 过滤列表需要扩展
+       当前: ['esi','edi','ebp','rsi','rdi','rbp']
+       应改为包含所有 VM 基础设施操作
+
+3. 需要手动设置:
+   通过 Settings 窗口设置 VMContext:
+     - vm_addr = 0x1404463C2
+     - code_start, code_end = 待确定（字节码区域）
+     - base_addr = 待确定（handler 偏移表基址）
+
+4. 建议的分析流程:
+   ① 在 IDA 中设断点在 VM 入口
+   ② 生成完整 trace
+   ③ 使用常量传播（会揭示实际的寄存器值）
+   ④ 使用 grading_automaton（MBA 噪声会自动降分）
+   ⑤ 手动检查高分行，还原语义
+```
+
+#### 方案 B：静态分析适配（工作量大）
+
+如果需要完整的静态分析能力：
+
+```
+Layer 0: 新增 MBA 化简器（最重要的前置步骤）
+  lib/MBASimplifier.py:
+    - 识别 not+xchg 寄存器保存模式 → 简化为 mov
+    - 识别 xor [rip+C1]; xor [rip+C2] 对消 → 删除
+    - 识别 not; xor; not 恒等链 → 删除
+    - 识别 and a,a / or a,a 冗余 → 删除
+    - 处理 [rip+offset] 常量引用 → 用实际值替换
+
+Layer 1: 修改 Instruction.py
+  - is_catch_instr(): 
+      识别 "mov reg, word ptr [LOADED_VPC]" 模式
+      LOADED_VPC 是从 [rbp+0x60] 加载到某 GPR 的值
+  - is_vinst(): 
+      识别涉及 [rbp+0x60] 或已知 VPC 寄存器的指令
+  - is_write_stack() / is_read_stack(): 
+      识别 [rbp+0x88+] 范围的栈操作（非上下文区域）
+  - is_sub_basepointer() / is_add_basepointer():
+      此 VM 可能不使用 sub/add rbp（rbp 是固定的上下文指针）
+      需要分析 VM 栈指针的实际操作方式
+
+Layer 2: 修改 static_deobfuscate.py
+  - calc_code_addr(): 
+      需要模拟 MBA 混淆的地址计算
+      或建立 opcode → handler 映射表（通过穷举或 trace）
+  - get_instruction_list():
+      终止条件改为检测 "lea [rip+base] + movsxd + jmp reg" 模式
+  - first_deobfuscate():
+      操作码读取改为 Word(addr)（2字节）
+      catch 长度计算需调整
+
+Layer 3: 修改 VmInstruction.py
+  - 所有模式匹配需要在 MBA 化简后的指令上进行
+  - 可能需要新增模式来适应不同的 handler 实现
+```
+
+#### 方案 C：混合方案（最实用）
+
+```
+动态采集 → 静态辅助:
+
+1. 用动态 trace 建立 handler 映射表
+   - 在 dispatch 处记录: (VPC值, 操作码, handler入口)
+   - 自动发现所有使用到的 handler
+
+2. 用 trace 驱动 MBA 化简
+   - 对每个 handler 用 trace 中的实际值验证 MBA 化简结果
+   - 确保化简正确后再做模式匹配
+
+3. 用静态分析深化理解
+   - 对化简后的 handler 做 VmInstruction 模式匹配
+   - 结果交叉验证
+
+这种方案利用了动态分析的准确性和静态分析的完整性。
+```
+
+### 7.8 此 VM 的独特挑战总结
+
+1. **内存化 VPC**: 字节码指针不在固定寄存器中，而是存在 VM 上下文的 `[rbp+0x60]` 位置，每次 handler 需要先加载
+2. **MBA 混淆密度极高**: 每个 handler 约 60-150 条指令，其中超过 70% 是混淆噪声
+3. **分散式 dispatch**: 无集中分发循环，每个 handler 自行完成 fetch-decode-dispatch
+4. **操作码加密**: 从字节码读取的 word 经过多层 xor/and/or 变换后才能得到真实的 handler 索引
+5. **跳转寄存器不固定**: 不同 handler 末尾的 `jmp` 使用不同寄存器（rdx/r8/r9/r11/rax/rcx）
+
+这些特征表明这是一个**高度定制的 VM 保护方案**，比标准 VMProtect 更难分析。适配 VMAttack 需要显著的工作量，建议以动态分析为主要手段。
