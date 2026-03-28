@@ -1,4 +1,9 @@
 # coding=utf-8
+"""旧版（legacy）UI：栈变化分析查看器。
+
+与 ui 下同名实现职责相同：列出执行过程中栈地址、映射到的 CPU 寄存器及取值变化，
+便于对照虚拟寄存器表示（vr）理解栈行为。
+"""
 __author__ = 'Anatoli Kalysch'
 
 from ui.PluginViewer import PluginViewer

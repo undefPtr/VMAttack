@@ -1,4 +1,9 @@
 # coding=utf-8
+"""旧版（legacy）UI：迹优化（Trace Optimizations）查看器。
+
+在旧版 Qt 栈上提供与 ui 目录同名模块相同的交互：对回溯迹应用各类优化、联动
+ClusterViewer、撤销与进度展示等，用于精简或变形 VM 相关执行迹。
+"""
 __author__ = 'Anatoli Kalysch'
 
 from _collections import deque

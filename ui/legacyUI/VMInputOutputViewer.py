@@ -1,4 +1,9 @@
 # coding=utf-8
+"""旧版（legacy）UI：虚拟机输入/输出分析查看器。
+
+基于 Qt4/PySide，与 ui 包中对应查看器一致：区分并高亮迹中的输入集与输出集、
+按寄存器组织上下文行，支持选择器筛选以分析 VM 的 I/O 模式。
+"""
 __author__ = 'Anatoli Kalysch'
 from copy import deepcopy
 

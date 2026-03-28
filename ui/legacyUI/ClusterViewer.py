@@ -1,4 +1,9 @@
 # coding=utf-8
+"""旧版（legacy）UI：聚类分析结果查看器。
+
+基于兼容旧版 IDA 的 Qt4/PySide（见 ui.UIManager）实现，职责与 ui 包下同名的
+ClusterViewer 一致：以表格展示回溯迹上的聚类分析结果，并支持交互式编辑与保存。
+"""
 __author__ = 'Anatoli Kalysch'
 
 import re

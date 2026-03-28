@@ -1,4 +1,9 @@
 # coding=utf-8
+"""Immunity Debugger 调试器适配：继承 Debugger，面向 ImmunityDbg 环境。
+
+提供断点、单步、轨迹生成与局部执行等接口的统一封装；当前实现为占位桩，
+各方法返回 TODO 提示，后续可接入 Immunity 脚本 API 完成实际调试与采迹逻辑。
+"""
 __author__ = 'Anatoli Kalysch'
 
 

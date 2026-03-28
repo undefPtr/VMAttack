@@ -1,4 +1,9 @@
 # coding=utf-8
+"""旧版（legacy）UI：评分系统（Grading）分析查看器。
+
+基于 Qt4/PySide 实现，与 ui 目录下同名模块功能一致：按阈值过滤并展示迹中各指令的等级，
+辅助分析虚拟机或保护相关迹的质量与可疑程度。
+"""
 from ui.NotifyProgress import NotifyProgress
 
 __author__ = 'Anatoli Kalysch'

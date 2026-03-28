@@ -1,4 +1,9 @@
 # coding=utf-8
+"""OllyDbg 调试器适配：继承 Debugger，在 OllyDbg 插件/脚本环境中通过 ollyapi 工作。
+
+封装断点、单步、轨迹生成与执行区间等通用调试能力；当前为占位桩实现，
+方法均返回 TODO 占位信息，待与 Olly 的 API 对接后补全真实行为。
+"""
 __author__ = 'Anatoli Kalysch'
 
 from Debugger import Debugger

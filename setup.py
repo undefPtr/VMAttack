@@ -1,4 +1,10 @@
 # coding=utf-8
+"""
+VMAttack 项目的安装与依赖管理脚本。
+
+通过 pip 安装或卸载 distorm3、idacute 等依赖，用 setx 设置 VMAttack 环境变量，
+并将 VMAttack_plugin_stub.py 复制到用户指定的 IDA 插件目录；卸载时可按记录路径移除桩文件。
+"""
 __author__ = 'Anatoli Kalysch'
 
 import pip
