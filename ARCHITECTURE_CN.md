@@ -327,28 +327,324 @@ Instruction 类底层依赖 distorm3，存在以下限制：
 
 ### 5.2 虚拟指令识别 (VmInstruction)
 
-VM字节码的每个字节通过跳转表映射到一组x86 handler指令。VmInstruction 分析这些指令的模式，识别出15种虚拟指令：
+VM字节码的每个字节通过跳转表映射到一组x86 handler指令。VmInstruction 分析这些指令的模式，识别出15种虚拟指令。
 
-| 虚拟指令 | 识别特征 | 语义 |
-|---------|---------|------|
-| vpush | sub ebp + mov [ebp], val | VM栈压栈 |
-| vpop | mov val, [ebp] + add ebp | VM栈出栈 |
-| vadd | add reg1, reg2 (非立即数) | 加法运算 |
-| vnor | not + not + and | NOR运算(~a & ~b) |
-| vjmp | mov esi, addr + add ebp | VM跳转(修改指令指针) |
-| vret | ret | VM函数返回 |
-| vread | mov reg, [mem] (非栈) | 内存读取 |
-| vwrite | mov [mem], reg (非栈) | 内存写入 |
-| vshr/vshl | shr/shl reg1, reg2 | 移位运算 |
-| vshrd/vshld | shrd/shld 三操作数 | 双精度移位 |
-| vcall | call addr | 函数调用 |
-| vimul | imul reg1, reg2 | 有符号乘法 |
-| vidiv | idiv reg | 有符号除法 |
-| vebp_mov | mov ebp_variant, ebp_variant | 栈帧操作 |
+#### 5.2.1 预处理：指令分类
 
-**识别策略**：在handler指令中寻找"特征动作"——例如 `sub ebp` 是 vpush 的标志（分配栈空间），`add ebp` 是 vpop 的标志（释放栈空间）。ESI/RSI 相关的指令被归类为VM基础设施（Vinstructions），不参与虚拟指令识别。
+`VmInstruction.__init__()` 首先将 handler 的 `List[Instruction]` 按 ESI/RSI 关联性分为两组：
 
-### 5.2 Trace优化算法 (TraceOptimizations)
+```
+handler 指令列表 (all_instructions)
+    │
+    ├─ inst.is_vinst() == True  →  Vinstructions  (VM 基础设施：字节码指针移动)
+    │                                              不参与模式匹配，仅 vjmp 使用
+    │
+    └─ inst.is_vinst() == False →  Instructions    (实际计算逻辑)
+                                                   所有模式匹配均在此列表上进行
+```
+
+然后调用 `get_pseudo_code()` 按优先级依次尝试 15 种模式，**首个匹配成功的即为结果**。
+
+#### 5.2.2 15 种模式匹配算法详解
+
+匹配优先级从上到下（代码中的调用顺序即匹配优先级）：
+
+**① vpush — 压栈** (`is_push`)
+
+```
+特征组合: sub ebp, N + mov [ebp], value
+    │
+    ├─ 在 Instructions 中找到 is_sub_basepointer() → 确认栈指针下移
+    │     size = N / 8（分配的字节数 → 即操作数大小）
+    │
+    ├─ 检查是否有 is_cwde() / is_cbw() → 是否需要符号扩展
+    │
+    ├─ 向后搜索唯一的 is_write_stack() → mov [ebp], reg
+    │     操作数 = 从 reg 向前追踪 mov 链到最终来源
+    │
+    ├─ 如果 catch_value != -1 → 替换 catch 寄存器为立即数值
+    │
+    └─ 产出: PseudoInstruction('vpush', addr, [operand], size, PUSH_T)
+```
+
+**② vpop — 出栈** (`is_pop`)
+
+```
+特征组合: mov value, [ebp] + add ebp, N
+    │
+    ├─ 在 Instructions 中找到 is_add_basepointer() → 确认栈指针上移
+    │     size = N / 8（释放的字节数）
+    │
+    ├─ 向前搜索 is_read_stack() → mov reg, [ebp]
+    │     操作数 = 从 reg 向后追踪 mov 链到最终目的
+    │
+    ├─ 若无 read_stack → 可能是 popf，检查 add ebp 前的指令
+    │
+    └─ 产出: PseudoInstruction('vpop'/'vpopf', addr, [operand], size, POP_T)
+```
+
+**③ vadd — 加法** (`is_add`)
+
+```
+特征: add reg1, reg2（第二操作数非立即数）
+    │
+    ├─ 在 Instructions 中找到 is_add() 且 NOT op_is_imm(2) → 真正的加法
+    │
+    ├─ 取 add 的两个操作数，通过 get_reg_name() 获取寄存器名
+    │     向前 mov 链追溯两路输入的最终来源
+    │
+    └─ 产出: PseudoInstruction('vadd', addr, [op0, op1], size, ADD_T, IN2_OUT2)
+```
+
+**④ vnor — NOR 运算** (`is_nor`)
+
+```
+特征: not reg_a + not reg_b + and reg_a, reg_b（两路取反后逻辑与 = NOR）
+    │
+    ├─ 寻找 is_and() 指令 → and reg1, reg2
+    │
+    ├─ 向前追溯：
+    │     找到 is_not() 且操作数与 and 的 reg1 同类 → 第一路 not
+    │     找到 is_not() 且操作数与 and 的 reg2 同类 → 第二路 not
+    │
+    ├─ 从两个 not 之前分别向前追溯 mov 链 → 确定原始操作数
+    │
+    └─ 产出: PseudoInstruction('vnor', addr, [op0, op1], size, NOR_T, IN2_OUT2)
+```
+
+**⑤ vjmp — VM 跳转** (`is_jmp`)
+
+```
+特征: 在完整 handler（含 Vinstructions）中匹配 ESI/RSI 被更新
+    │
+    ├─ 遍历 all_instructions（包含 VM 基础设施指令）
+    │     找到 is_isp_mov() → mov esi/rsi, reg（更新 VM 指令指针）
+    │
+    ├─ 同时检查是否有 is_add_basepointer() → add ebp, N
+    │     有 → 带有 pop 语义（跳转前弹出地址）
+    │
+    ├─ 从 ISP mov 的源操作数向前追溯 → 确定跳转目标
+    │
+    └─ 产出: PseudoInstruction('vjmp', addr, [target], size, JMP_T, IN1_OUT0)
+```
+
+**⑥ vwrite — 内存写** (`is_write`)
+
+```
+特征: mov [mem], reg（目的为内存，但不是 VM 栈 is_write_stack）
+    │
+    ├─ 找到 is_mov() 且 op_is_mem(1) 且 NOT is_write_stack()
+    │     排除 VM 栈操作，确保是对外部内存的写入
+    │
+    ├─ 追溯写入地址（op1 的内存引用链）和写入数据（op2 的 mov 链）
+    │
+    └─ 产出: PseudoInstruction('vwrite', addr, [addr_op, data_op], size, WRITE_T, IN2_OUT0)
+```
+
+**⑦ vread — 内存读** (`is_read`)
+
+```
+特征: mov reg, [mem]（源为内存，但不是 VM 栈 is_read_stack）
+    │
+    ├─ 找到 is_mov() 且 op_is_mem(2) 且 NOT is_read_stack()
+    │
+    ├─ 追溯读取地址和读取结果的 mov 链
+    │
+    └─ 产出: PseudoInstruction('vread', addr, [addr_op], size, READ_T, IN1_OUT1)
+```
+
+**⑧ vshr — 逻辑右移** (`is_shift_right`)
+
+```
+特征: shr reg_dest, reg_count（双寄存器，dest ≠ count）
+    │
+    ├─ 找到 is_shr() → shr 指令
+    ├─ 两个操作数必须都是寄存器且不同类
+    ├─ 向前追溯两路输入的 mov 链
+    │
+    └─ 产出: PseudoInstruction('vshr', addr, [op0, op1], size, inst_type, IN2_OUT2)
+```
+
+**⑨ vshl — 逻辑左移** (`is_shift_left`)
+
+与 vshr 对称，查找 `is_shl()` 指令。
+
+**⑩ vshrd — 双精度右移** (`is_shrd`)
+
+```
+特征: shrd reg1, reg2, reg3（三个寄存器操作数，reg1 ≠ reg2）
+    │
+    ├─ 找到 is_shrd() → shrd 指令
+    ├─ 三个操作数分别追溯 mov 链
+    │
+    └─ 产出: PseudoInstruction('vshrd', addr, [op0, op1, op2], size, inst_type, IN3_OUT2)
+```
+
+**⑪ vshld — 双精度左移** (`is_shld`)
+
+与 vshrd 对称，查找 `is_shld()` 指令。
+
+**⑫ vcall — 函数调用** (`is_vcall`)
+
+```
+特征: handler 中出现 call 指令
+    │
+    ├─ 找到 is_call() → call 指令
+    ├─ 通过向前 mov 链解析调用目标
+    │
+    └─ 产出: PseudoInstruction('vcall', addr, [target_op])
+```
+
+**⑬ vret — 返回** (`is_vret`)
+
+```
+特征: handler 中出现 ret 指令
+    │
+    ├─ 找到 is_ret()
+    │     注: 具体的 pop 恢复寄存器由 add_ret_pop() 后处理
+    │
+    └─ 产出: PseudoInstruction('vret', addr, [], size, RET_T)
+```
+
+**⑭ vimul — 有符号乘法** (`is_imul`)
+
+```
+特征: imul reg1, reg2（含隐式 eax 的两路输入）
+    │
+    ├─ 找到 is_imul() → imul 指令
+    ├─ 向前追溯两个操作数的 mov 链
+    │
+    └─ 产出: PseudoInstruction('vimul', addr, [op0, op1], size, IMUL_T, IN2_OUT3)
+```
+
+**⑮ vidiv — 有符号除法** (`is_idiv`)
+
+```
+特征: idiv reg（被除数隐含为 edx:eax，除数为 idiv 的操作数）
+    │
+    ├─ 找到 is_idiv() → idiv 指令
+    ├─ 向前追溯 3 个隐式/显式输入
+    │
+    └─ 产出: PseudoInstruction('vidiv', addr, [op_eax, op_edx, op_divisor], size, DIV_T, IN3_OUT3)
+```
+
+**⑯ vebp_mov — 栈帧操作** (`is_mov_ebp`)
+
+```
+特征: mov 的两操作数均属于 ebp/rbp 家族
+    │
+    └─ 产出: PseudoInstruction('vebp_mov', addr, [op0, op1], size, MOV_EBP_T)
+```
+
+#### 5.2.3 共用辅助函数
+
+| 函数 | 作用 |
+|------|------|
+| `get_previous(inst_lst, inst)` | 获取指令在列表中的前一条 |
+| `get_subsequent(inst_lst, inst)` | 获取指令在列表中的后一条 |
+| `make_op(inst, op_idx, catch_value)` | 将 Instruction 操作数转为 PseudoOperand |
+| `extend_signed_catch_val(catch_val, size)` | 将无符号 catch 值按 size 进行有符号扩展 |
+
+所有模式都遵循相同的**向前 mov 链追溯**策略：从特征指令出发，沿 mov 链向前回溯操作数来源，最终转为 PseudoOperand（寄存器/立即数/内存类型）。
+
+### 5.3 PseudoInstruction：中间表示(IR)设计
+
+#### 5.3.1 操作数类型体系
+
+```
+Operand (基类)
+├── PseudoOperand     — 类x86操作数（寄存器/立即数/内存/引用/指针）
+│     ├── REGISTER_T  — 寄存器操作数 (register='eax', size=32)
+│     ├── IMMEDIATE_T — 立即数操作数 (val=0x42, size=32)
+│     ├── MEMORY_T    — 内存操作数   (register='ebp', displacement=8)
+│     ├── REFERENCE_T — 引用操作数   (地址解引用 → '[addr]')
+│     └── POINTER_T   — 指针操作数   (地址引用 → '&name')
+│
+├── ScratchOperand    — VM栈暂存区 (ST_xx)
+│     通过 EDI 间接寻址的 VM 内部暂存区
+│     由 get_scratch_variable() 自动识别 vpush/vpop 中 [edi+offset] 模式
+│     values 字典全局维护所有 ST_xx 的当前值
+│
+├── VariableOperand   — 临时变量 (T_xx)
+│     由 make_pop_push_rep() 在 push/pop 展开时创建
+│     全局计数器确保每个 T_N 唯一
+│     is_flags=True 时复用上一编号 → FLAGS T_N
+│
+├── ArrayOperand      — 数组操作数 (A_xx)
+│     表示 VM 栈上多个连续值，用于 replace_push_ebp 优化
+│     op_val 列表存储各元素的操作数
+│
+└── DoubleVariable    — 双结果操作数
+      用于 vimul(2个结果) / vidiv(2个结果) 的乘除法
+      left + right 各为一个 VariableOperand
+```
+
+#### 5.3.2 指令类型与 I/O 模式
+
+```
+指令类型 (inst_type)              I/O 模式 (inst_class)
+─────────────────────            ──────────────────────
+PUSH_T    vpush/vpushf           IN2_OUT2  vadd/vnor/vshr/vshl
+POP_T     vpop/vpopf             IN2_OUT3  vimul（2输入3输出）
+ADD_T     vadd                   IN3_OUT2  vshrd/vshld（3输入2输出）
+NOR_T     vnor                   IN3_OUT3  vidiv（3输入3输出）
+READ_T    vread                  IN1_OUT1  vread
+WRITE_T   vwrite                 IN2_OUT0  vwrite
+JMP_T     vjmp                   IN1_OUT0  vjmp
+RET_T     vret                   ASSIGNEMENT_T  优化后的赋值形式
+MOV_EBP_T vebp_mov
+IMUL_T    vimul
+DIV_T     vidiv
+NOT_T     vnot（优化产物）
+UNDEF_T   未识别
+NOTHING_T 空/赋值
+```
+
+#### 5.3.3 make_pop_push_rep() 展开规则
+
+每种 I/O 模式有固定的展开模板：
+
+```
+IN2_OUT2 (vadd/vnor/vshr/vshl):
+  vpop T_0          ; 弹出操作数1
+  vpop T_1          ; 弹出操作数2
+  T_2 = vmnem T_0, T_1  ; 赋值语句
+  vpush T_2         ; 压入结果
+  vpush FLAGS T_2   ; 压入标志位
+
+IN2_OUT3 (vimul):
+  vpop T_0          ; 弹出乘数1
+  vpop T_1          ; 弹出乘数2
+  T_2:T_3 = vimul T_0, T_1  ; 双结果赋值
+  vpush T_2         ; 压入低位结果
+  vpush T_3         ; 压入高位结果
+  vpush FLAGS       ; 压入标志位
+
+IN3_OUT3 (vidiv):
+  vpop T_0          ; 弹出被除数高位
+  vpop T_1          ; 弹出被除数低位
+  vpop T_2          ; 弹出除数
+  T_3:T_4 = vidiv T_0, T_1, T_2  ; 双结果赋值（商:余数）
+  vpush T_4         ; 压入余数
+  vpush T_3         ; 压入商
+  vpush FLAGS       ; 压入标志位
+
+IN1_OUT0 (vjmp):
+  vpop T_0          ; 弹出跳转目标地址
+  vjmp T_0          ; 跳转
+
+IN1_OUT1 (vread):
+  vpop T_0          ; 弹出读取地址
+  T_1 = vread [T_0] ; 从内存读取
+  vpush T_1         ; 压入读取值
+
+IN2_OUT0 (vwrite):
+  vpop T_0          ; 弹出写入地址
+  vpop T_1          ; 弹出写入数据
+  [T_0] = vwrite T_1 ; 写入内存
+```
+
+### 5.4 Trace 优化算法 (TraceOptimizations)
 
 | 优化名称 | 类型 | 安全性 | 核心原理 |
 |---------|------|--------|---------|
@@ -358,7 +654,7 @@ VM字节码的每个字节通过跳转表映射到一组x86 handler指令。VmIn
 | 无用操作数折叠 | 折叠 | 需谨慎 | 删除写后未读就被覆盖的操作 |
 | 窥孔优化 | 折叠 | 需谨慎 | 删除VM handler高频地址+模式匹配精简 |
 
-### 5.3 评分系统 (Grading Automaton)
+### 5.5 评分系统 (Grading Automaton)
 
 评分系统是本插件的核心自动分析能力，通过8个阶段综合评分：
 
@@ -373,7 +669,7 @@ VM字节码的每个字节通过跳转表映射到一组x86 handler指令。VmIn
 
 设计特点：**累积评分机制**，单个分析步骤的失败不会导致整体结果错误。用户可通过Settings调整各分析步骤的权重(importance)或将其设为0禁用。
 
-### 5.4 伪指令优化管线 (Optimize)
+### 5.6 伪指令优化管线 (Optimize)
 
 静态反混淆产生的push/pop伪指令经过10步优化：
 
@@ -935,3 +1231,346 @@ optimizations = [
 | `find_input/output/virtual_regs` | 调用时 deepcopy | 各分析独立运行 |
 
 这意味着即使优化函数会修改 Traceline 的 disasm、comment 字段，或直接删除行（折叠型优化），原始数据始终安全。
+
+## 11. TraceAnalysis 动态分析算法详解
+
+### 11.1 聚类分析 (repetition_clustering)
+
+聚类分析的目标是将 trace 中重复出现的指令序列归组，从而识别出 VM handler 的循环模式。
+
+#### 算法流程
+
+```
+repetition_clustering(trace, rounds=None)
+│
+├─ 输入: Trace 对象（按执行顺序排列的 Traceline 列表）
+│
+├─ 贪心模式 (rounds=None, 默认):
+│     pre = 1, post = 0
+│     while pre != post:        ← 直到列表长度不再变化
+│         pre = len(cluster)
+│         cluster = repetition_cluster_round(cluster)
+│         post = len(cluster)
+│
+├─ 固定轮次模式 (rounds=N):
+│     for j in range(N):
+│         cluster = repetition_cluster_round(cluster)
+│
+└─ 返回: 混合列表 [Traceline | List[Traceline]]
+         Traceline = 单独行（非重复）
+         List[Traceline] = 一个聚类（重复出现的相邻序列）
+```
+
+#### 单轮聚类 repetition_cluster_round()
+
+```
+1. 将列表中相邻元素两两配对: [(elem_0, elem_1), (elem_2, elem_3), ...]
+
+2. 对每一对 (a, b)：
+   检查 a 和 b 在列表中出现次数是否相等
+   且满足: count(相邻出现) > cluster_magic (默认=2)
+
+3. 如果满足 → 合并为一个聚类:
+   - Traceline + Traceline → [a, b]
+   - List + Traceline → list.append(b)
+   - Traceline + List → [a] + list
+   - List + List → list1.extend(list2)
+
+4. 清理: 删除 BADADDR 的无效行
+
+5. 断言: 合并前后总行数不变（数据完整性检查）
+```
+
+### 11.2 VM 上下文动态发现 (dynamic_vm_values)
+
+从运行时 trace 中自动推断 VM 的 4 个关键地址：
+
+```
+dynamic_vm_values(trace)
+│
+├─ 1. 定位 VM 函数 (vm_addr)
+│     find_vm_addr(trace):
+│       统计每条 push 指令所属函数 → 出现 push 最多的函数
+│       验证: 该函数应为所在段中最大的函数（by 代码大小）
+│       冲突时弹出对话框让用户选择
+│
+├─ 2. 提取 VM 段
+│     extract_vm_segment(trace):
+│       优先按段名 ".vmp" 查找
+│       失败则用 vm_addr 所在段
+│       仅保留 trace 中地址在段内的行
+│
+├─ 3. 推断跳转表基址 (base_addr)
+│     在 trace 中统计 "off_XXXX[...]" 形式的间接引用
+│     取出现频率最高的地址作为候选
+│     向前回退到表的真正起始位置（跳过空数据项）
+│
+├─ 4. 推断字节码起始 (code_start)
+│     从 vm_addr 函数末尾向后查找非代码区域起始
+│     同时检查 trace 中调用 vm_func 前的 push 参数
+│     两者不一致时弹出对话框确认
+│
+├─ 5. 推断字节码结束 (code_end)
+│     默认使用 vm_seg_end（.vmp 段结束地址）
+│
+└─ 返回: VMContext(code_start, code_end, base_addr, vm_addr)
+```
+
+### 11.3 虚拟寄存器映射 (find_virtual_regs)
+
+VM 退出时通过一系列 pop 指令将 VM 栈上的值恢复到真实寄存器。此函数反向分析这些 pop，建立「栈地址 → 真实寄存器」映射。
+
+```
+find_virtual_regs(trace)
+│
+├─ 从 trace 末尾向前遍历（pop 序列在最后）
+│
+├─ 对每条 pop reg:
+│     if reg 是有效寄存器（get_reg_class 非 None）且尚未记录:
+│         stack_addr = 上一条指令的 ctx[rsp]  ← pop 前的栈顶
+│         virt_regs[reg] = stack_addr
+│
+└─ 返回: dict { 'eax': 'FF80', 'ebx': 'FF84', ... }
+         键 = 真实寄存器名
+         值 = VM 栈上对应的地址（十六进制字符串）
+```
+
+### 11.4 输入分析 (find_input)
+
+黑盒追踪 VM 函数接收的输入参数值。
+
+```
+find_input(trace)
+│
+├─ 1. 提取 VM 段内 trace
+│     extract_vm_segment(deepcopy(trace))
+│
+├─ 2. 扫描 ss: 前缀操作数
+│     trace 中出现 "ss:[reg]" 形式的操作数
+│     → 从 ctx 中读取对应寄存器的值 → 加入输入集合
+│
+├─ 3. 调用约定分析
+│     find_ops_callconv(trace, vmp_start, vmp_end):
+│       反向搜索调用 VM 函数前的 push 和 mov [esp±...] 指令
+│       提取被传递的参数值（寄存器值或立即数）
+│
+├─ 4. 合并调试器捕获的参数
+│     如果 vmr.func_args 非空（由 IDADebugger 在 trace 时提取）
+│     直接加入输入集合
+│
+└─ 返回: set { 'FF', '42', ... }（十六进制值字符串）
+```
+
+### 11.5 输出分析 (find_output)
+
+追踪 VM 函数返回时各寄存器的值（输出值）。
+
+```
+find_output(trace)
+│
+├─ 提取 VM 段内 trace，反转
+│
+├─ 从末尾向前找到第一条 ret 或 pop 指令
+│     获取该点的 ctx（CPU 上下文快照）
+│
+└─ 返回: set { ctx[reg] for each reg where get_reg_class(reg) is not None }
+         即所有标准 GPR 寄存器在 VM 退出时的值
+```
+
+### 11.6 虚拟寄存器回溯 (follow_virt_reg)
+
+从 VM 出口的某个寄存器值反向追踪其完整计算过程，提取所有参与该计算的 trace 行。
+
+```
+follow_virt_reg(trace, virt_reg_addr, real_reg_name)
+│
+├─ 预处理: 常量传播 + 栈地址传播
+│
+├─ 反转 trace（从后向前遍历）
+│
+├─ 初始化:
+│     从末尾 pop reg 获取目标值 → reg_vals = {初始值}
+│     watch_addrs = {virt_reg_addr}（关注的栈地址）
+│
+├─ 反向遍历:
+│     对每一行:
+│       ┌─ 值追踪: 某关注值首次出现在 ctx 中
+│       │   ├─ mov from mem → 源地址加入 watch_addrs
+│       │   └─ 计算指令 → 操作数的寄存器值加入 reg_vals
+│       │     记录该行到 backtrace
+│       │
+│       └─ 地址监视: 某关注地址被写入
+│           记录该行到 backtrace
+│           写入数据的值加入 reg_vals
+│           如果是 mov → 从 watch_addrs 移除（值已找到来源）
+│
+├─ 反转 backtrace 回正常顺序
+│
+├─ 过滤: 移除与 VM 基础设施相关的行
+│     (esi/edi/ebp/rsi/rdi/rbp 操作)
+│
+└─ 返回: Trace 仅包含与目标寄存器计算相关的行
+```
+
+#### 回溯策略的核心思想
+
+```
+时间轴（正向）:  ────────────────────────────────→
+                 mov eax,[ebp+4]  add eax,ebx  pop ecx (ecx=eax的值)
+                      ↑                ↑            ↑
+                  watch_addr 命中   计算指令      初始种子
+
+回溯方向（反向）: ←────────────────────────────────
+                 从 pop 的值出发，沿数据流反向扩展关注集合
+```
+
+## 12. Grading Automaton 8 阶段评分算法详解
+
+评分系统是 VMAttack 最核心的自动分析能力，将多种分析手段的结果通过**累积评分机制**融合，自动筛选出 trace 中最可能携带"真实语义"的指令行。
+
+### 12.1 设计哲学
+
+- **累积而非淘汰**：每个阶段独立加分/减分，单个阶段失败不影响整体结果
+- **可配置权重**：用户通过 Settings 窗口调整各分析步骤的权重（`vmr.in_out` / `vmr.pa_ma` / `vmr.clu` / `vmr.mem_use` / `vmr.static`），或设为 0 禁用
+- **保护原始数据**：所有操作在 `prepare_trace()` 的深拷贝上进行
+
+### 12.2 8 阶段详细流程
+
+```
+grading_automaton(visualization=0)
+│
+│ trace = prepare_trace()           ← 深拷贝 vmr.trace
+│ orig_trace = deepcopy(trace)      ← 再拷贝一份供递归检测用
+│
+│ ═══════════════════════════════════════════════════════════════
+│ 阶段 1: 唯一性初始化                                    [10%]
+│ ═══════════════════════════════════════════════════════════════
+├─ init_grading(trace):
+│     统计每个地址出现的次数
+│     grade = max_count - 该地址出现次数
+│     出现越少（越独特）→ 初始分越高
+│     出现最多的地址 → grade = 0
+│
+│ ═══════════════════════════════════════════════════════════════
+│ 阶段 2: 寄存器频率分类                                  [20%]
+│ ═══════════════════════════════════════════════════════════════
+├─ 统计 disasm[2]（第二操作数侧）出现的寄存器类频率
+│     按频率降序排列
+│     高频一半 → disregard_regs（VM 基础设施寄存器）
+│     低频一半 → important_regs（更可能携带语义的寄存器）
+│     奇数个时多划一个到 disregard 组（保守策略）
+│
+│ ═══════════════════════════════════════════════════════════════
+│ 阶段 3: 优化预处理                                      [30%]
+│ ═══════════════════════════════════════════════════════════════
+├─ if not trace.constant_propagation:
+│     trace = optimization_const_propagation(trace)
+│  if not trace.stack_addr_propagation:
+│     trace = optimization_stack_addr_propagation(trace)
+│  目的: 让后续 I/O 分析、聚类、窥孔等在同一抽象层上工作
+│
+│ ═══════════════════════════════════════════════════════════════
+│ 阶段 4: 输入/输出分析提升                               [45%]
+│ ═══════════════════════════════════════════════════════════════
+├─ values = find_input(trace) ∪ find_output(trace)
+│     对 trace 中每一行:
+│       if 行的字符串表示包含某个 I/O 值:
+│         line.raise_grade(vmr.in_out)           ← 加分
+│
+├─ virt_regs = find_virtual_regs(trace)
+│     对每个虚拟寄存器:
+│       if 其真实寄存器 ∈ important_regs:
+│         follow_virt_reg() 回溯的每一行 → raise_grade(vmr.in_out)
+│       elif 其真实寄存器 ∈ disregard_regs:
+│         follow_virt_reg() 回溯的每一行 → lower_grade(vmr.in_out)
+│
+│ ═══════════════════════════════════════════════════════════════
+│ 阶段 5: 寄存器频率降分                                  [60%]
+│ ═══════════════════════════════════════════════════════════════
+├─ 合并 disasm[1] 侧的寄存器频率到 reg_dict
+│     重新排序，高频一半 → disregard_regs
+│
+├─ 对 trace 中每一行:
+│     if jmp/mov/pop/push/ret/inc/lea:
+│       line.lower_grade(vmr.pa_ma)              ← 模板指令降分
+│     elif disasm[1] 的寄存器类 ∈ disregard_regs:
+│       line.lower_grade(vmr.pa_ma)              ← 高频寄存器降分
+│
+│ ═══════════════════════════════════════════════════════════════
+│ 阶段 6: 聚类分析提升                                    [70%]
+│ ═══════════════════════════════════════════════════════════════
+├─ cluster_result = repetition_clustering(deepcopy(trace))
+│     遍历聚类结果:
+│       if isinstance(line, Traceline):           ← 单独行（非重复）
+│         trace 中对应行 raise_grade(vmr.clu)
+│       (聚类内的行不加分 → 重复行自然低分)
+│
+│ ═══════════════════════════════════════════════════════════════
+│ 阶段 7: 窥孔评分                                        [80%]
+│ ═══════════════════════════════════════════════════════════════
+├─ 对 trace 中每一行:
+│     if disasm[0] in [pop,push,inc,dec,lea,test]
+│        or jmp or mov or 以 'c'/'r' 开头:
+│       line.lower_grade(vmr.pa_ma)              ← 栈调度/跳转类降分
+│     elif 第一操作数寄存器编号 > 4:
+│       continue                                  ← 高编号寄存器跳过
+│     else:
+│       line.raise_grade(vmr.pa_ma)              ← 其余（运算类）加分
+│
+│ ═══════════════════════════════════════════════════════════════
+│ 阶段 8: 优化存活提升                                    [90%]
+│ ═══════════════════════════════════════════════════════════════
+├─ opti_trace = optimize(deepcopy(trace))
+│     对 opti_trace 中每一行:
+│       trace 中找到对应行 → raise_grade(vmr.pa_ma)
+│       if 内存操作且非 mov:
+│         raise_grade(vmr.mem_use)               ← 内存运算额外加分
+│       else:
+│         lower_grade(vmr.pa_ma)                 ← 简单指令微降
+│
+│ ═══════════════════════════════════════════════════════════════
+│ 附加: 静态分析交叉验证                                  [95%]
+│ ═══════════════════════════════════════════════════════════════
+├─ 从 IDA 注释中提取已静态标注的虚拟指令前缀
+│     对 trace 中助记符命中的行:
+│       raise_grade(vmr.static)
+│
+│ ═══════════════════════════════════════════════════════════════
+│ 附加: 递归调用检测                                      [100%]
+│ ═══════════════════════════════════════════════════════════════
+├─ find_vm_addr(orig_trace) → 定位 VM 函数地址
+│     检测 trace 中对 VM 函数的 call 次数
+│     如果存在递归调用 → 记录（可供 UI 提示用户）
+│
+└─ 输出:
+     visualization=0 → GradingViewer UI 展示（支持阈值过滤）
+     其他           → 控制台输出
+```
+
+### 12.3 评分权重体系
+
+| 权重变量 | 默认值 | 影响阶段 | 含义 |
+|---------|--------|---------|------|
+| `vmr.in_out` | 2 | 阶段4 | 输入/输出命中的加/降分幅度 |
+| `vmr.pa_ma` | 2 | 阶段5/7/8 | 模式匹配/窥孔/优化存活的加/降分幅度 |
+| `vmr.clu` | 1 | 阶段6 | 聚类分析中单独行的加分幅度 |
+| `vmr.mem_use` | 3 | 阶段8 | 内存运算的额外加分幅度（最高权重） |
+| `vmr.static` | 3 | 附加 | 静态分析交叉验证的加分幅度 |
+
+设为 0 可完全禁用对应分析步骤的影响。
+
+### 12.4 GradingViewer 阈值过滤
+
+评分完成后，GradingViewer 按以下策略展示结果：
+
+```
+threshold = grade_max * (percentage / 100)
+
+对 trace 中每一行:
+  if line.grade >= threshold:
+    展示（高亮显示）
+  else:
+    仅在 grade > 0 时作为上下文行显示（不高亮）
+```
+
+用户可通过滑动条调整 percentage（0-100%），实时筛选不同置信度的结果。
